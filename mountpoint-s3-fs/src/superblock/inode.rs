@@ -3,7 +3,7 @@ use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 
 use crate::metablock::{
-    InodeError, InodeErrorInfo, InodeKind, InodeNo, InodeStat, NEVER_EXPIRE_TTL, ROOT_INODE_NO, ValidKey,
+    Expiry, InodeError, InodeErrorInfo, InodeKind, InodeNo, InodeStat, NEVER_EXPIRE_TTL, ROOT_INODE_NO, ValidKey,
 };
 use crate::s3::Prefix;
 use crate::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -230,6 +230,86 @@ impl Inode {
         hasher.finalize()
     }
 
+    /// Invalidate the complete listing cache for this directory.
+    /// This should be called when directory contents may have changed.
+    pub fn invalidate_complete_listing_cache(&self) -> Result<(), InodeError> {
+        if self.kind() != InodeKind::Directory {
+            return Ok(());
+        }
+
+        let mut state = self.get_mut_inode_state()?;
+        match &mut state.kind_data {
+            InodeKindData::Directory { complete_listing, .. } => {
+                *complete_listing = None;
+            }
+            InodeKindData::File {} => unreachable!("we checked kind above"),
+        }
+        Ok(())
+    }
+
+    /// Check if this directory has a valid complete listing cache
+    pub fn has_valid_complete_listing(&self) -> Result<bool, InodeError> {
+        if self.kind() != InodeKind::Directory {
+            return Ok(false);
+        }
+
+        let state = self.get_inode_state()?;
+        match &state.kind_data {
+            InodeKindData::Directory { complete_listing, .. } => {
+                if let Some(cache) = complete_listing {
+                    let is_valid = cache.is_complete && !cache.expiry.is_expired();
+                    println!("READDIR CACHE DEBUG: Directory {} has cache entry: complete={}, expired={}, valid={}", 
+                             self.ino(), cache.is_complete, cache.expiry.is_expired(), is_valid);
+                    Ok(is_valid)
+                } else {
+                    println!("READDIR CACHE DEBUG: Directory {} has no cache entry", self.ino());
+                    Ok(false)
+                }
+            }
+            InodeKindData::File {} => unreachable!("we checked kind above"),
+        }
+    }
+
+    /// Set the complete listing cache for this directory
+    pub fn set_complete_listing_cache(
+        &self,
+        is_complete: bool,
+        last_continuation_token: Option<String>,
+        ttl: Duration,
+    ) -> Result<(), InodeError> {
+        if self.kind() != InodeKind::Directory {
+            return Ok(());
+        }
+
+        let mut state = self.get_mut_inode_state()?;
+        match &mut state.kind_data {
+            InodeKindData::Directory { complete_listing, .. } => {
+                *complete_listing = Some(CompleteListingCache {
+                    expiry: Expiry::from_now(ttl),
+                    last_continuation_token,
+                    is_complete,
+                });
+            }
+            InodeKindData::File {} => unreachable!("we checked kind above"),
+        }
+        Ok(())
+    }
+
+    /// Get the continuation token from the complete listing cache
+    pub fn get_listing_continuation_token(&self) -> Result<Option<String>, InodeError> {
+        if self.kind() != InodeKind::Directory {
+            return Ok(None);
+        }
+
+        let state = self.get_inode_state()?;
+        match &state.kind_data {
+            InodeKindData::Directory { complete_listing, .. } => {
+                Ok(complete_listing.as_ref().and_then(|cache| cache.last_continuation_token.clone()))
+            }
+            InodeKindData::File {} => unreachable!("we checked kind above"),
+        }
+    }
+
     /// Produce a description of this Inode for use in errors
     pub fn err(&self) -> InodeErrorInfo {
         InodeErrorInfo {
@@ -257,6 +337,17 @@ impl InodeState {
     }
 }
 
+/// Cache metadata for complete directory listings from S3.
+#[derive(Debug, Clone)]
+pub struct CompleteListingCache {
+    /// When this complete listing expires
+    pub expiry: Expiry,
+    /// Continuation token from last S3 call (None means fully enumerated)
+    pub last_continuation_token: Option<String>,
+    /// Whether the children HashMap represents a complete directory listing
+    pub is_complete: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum InodeKindData {
     File {},
@@ -273,6 +364,9 @@ pub enum InodeKindData {
 
         /// True if this directory has been deleted (`rmdir`) from its parent
         deleted: bool,
+
+        /// Complete listing cache metadata for readdir operations
+        complete_listing: Option<CompleteListingCache>,
     },
 }
 
@@ -284,6 +378,7 @@ impl InodeKindData {
                 children: Default::default(),
                 writing_children: Default::default(),
                 deleted: false,
+                complete_listing: None,
             },
         }
     }

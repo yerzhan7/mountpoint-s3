@@ -740,6 +740,12 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
             }
         }
         drop(state);
+
+        // Invalidate parent directory's complete listing cache since we're starting to write a child
+        if let Ok(parent) = self.inner.get(inode.parent()) {
+            let _ = parent.invalidate_complete_listing_cache();
+        }
+
         Ok(())
     }
 
@@ -1095,6 +1101,8 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
                         // Don't accidentally remove a newer inode (e.g. remote shadowing local)
                         if child.ino() == ino {
                             children.remove(removed_inode.name());
+                            // Invalidate parent directory cache since we removed an entry that may still exist on S3
+                            let _ = parent.invalidate_complete_listing_cache();
                         }
                     }
                     writing_children.remove(&ino);

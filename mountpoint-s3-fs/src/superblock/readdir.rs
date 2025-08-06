@@ -43,8 +43,9 @@
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
+use std::time::Duration;
 
-use super::{InodeKindData, LookedUpInode, RemoteLookup, SuperblockInner};
+use super::{Inode, InodeKindData, LookedUpInode, RemoteLookup, SuperblockInner};
 use crate::metablock::{InodeError, InodeKind, InodeNo, InodeStat};
 use crate::sync::atomic::{AtomicI64, Ordering};
 use crate::sync::{AsyncMutex, Mutex};
@@ -70,8 +71,13 @@ impl ReaddirHandle {
         full_path: String,
         page_size: usize,
     ) -> Result<Self, InodeError> {
+        let inode = inner.get(dir_ino)?;
+        
+        // Check if we have a valid complete listing cache
+        let use_cached_listing = inode.has_valid_complete_listing()?;
+        println!("READDIR CACHE DEBUG: Directory {} will use cached listing: {}", dir_ino, use_cached_listing);
+        
         let local_entries = {
-            let inode = inner.get(dir_ino)?;
             let kind_data = &inode.get_inode_state()?.kind_data;
             let local_files = match kind_data {
                 InodeKindData::File { .. } => return Err(InodeError::NotADirectory(inode.err())),
@@ -101,9 +107,17 @@ impl ReaddirHandle {
         };
 
         let iter = if inner.config.s3_personality.is_list_ordered() {
-            ReaddirIter::ordered(&inner.s3_path.bucket, &full_path, page_size, local_entries.into())
+            if use_cached_listing {
+                ReaddirIter::cached_ordered(&inner.s3_path.bucket, &full_path, page_size, local_entries.into(), &inode)
+            } else {
+                ReaddirIter::ordered(&inner.s3_path.bucket, &full_path, page_size, local_entries.into())
+            }
         } else {
-            ReaddirIter::unordered(&inner.s3_path.bucket, &full_path, page_size, local_entries.into())
+            if use_cached_listing {
+                ReaddirIter::cached_unordered(&inner.s3_path.bucket, &full_path, page_size, local_entries.into(), &inode)
+            } else {
+                ReaddirIter::unordered(&inner.s3_path.bucket, &full_path, page_size, local_entries.into())
+            }
         };
 
         Ok(Self {
@@ -130,7 +144,19 @@ impl ReaddirHandle {
         loop {
             let next = {
                 let mut iter = self.iter.lock().await;
-                iter.next(&inner.client).await?
+                let next_entry = iter.next(&inner.client).await?;
+                
+                // Check if the remote iteration has completed and populate cache if needed
+                if next_entry.is_none() && iter.is_remote_complete() {
+                    if let Ok(dir_inode) = inner.get(self.dir_ino) {
+                        let ttl = inner.config.cache_config.dir_ttl;
+                        let _ = dir_inode.set_complete_listing_cache(true, None, ttl);
+                        println!("READDIR CACHE DEBUG: Populated cache for directory {} after remote iteration completed, TTL: {:?}", 
+                                 self.dir_ino, ttl);
+                    }
+                }
+                
+                next_entry
             };
 
             if let Some(next) = next {
@@ -321,10 +347,26 @@ impl ReaddirIter {
         Self::Unordered(unordered::ReaddirIter::new(bucket, full_path, page_size, local_entries))
     }
 
+    fn cached_ordered(bucket: &str, full_path: &str, page_size: usize, local_entries: VecDeque<ReaddirEntry>, inode: &Inode) -> Self {
+        Self::Ordered(ordered::ReaddirIter::new_cached(bucket, full_path, page_size, local_entries, inode))
+    }
+
+    fn cached_unordered(bucket: &str, full_path: &str, page_size: usize, local_entries: VecDeque<ReaddirEntry>, inode: &Inode) -> Self {
+        Self::Unordered(unordered::ReaddirIter::new_cached(bucket, full_path, page_size, local_entries, inode))
+    }
+
     async fn next(&mut self, client: &impl ObjectClient) -> Result<Option<ReaddirEntry>, InodeError> {
         match self {
             Self::Ordered(iter) => iter.next(client).await,
             Self::Unordered(iter) => iter.next(client).await,
+        }
+    }
+
+    /// Check if the remote iteration (S3 ListObjectsV2 calls) is complete
+    fn is_remote_complete(&self) -> bool {
+        match self {
+            Self::Ordered(iter) => iter.is_remote_complete(),
+            Self::Unordered(iter) => iter.is_remote_complete(),
         }
     }
 }
@@ -468,6 +510,73 @@ mod ordered {
             }
         }
 
+        pub(super) fn new_cached(
+            _bucket: &str,
+            _full_path: &str,
+            _page_size: usize,
+            local_entries: VecDeque<ReaddirEntry>,
+            inode: &Inode,
+        ) -> Self {
+            // Create a cached iterator that uses the children from the inode instead of S3
+            let cached_entries = Self::extract_cached_entries(inode, local_entries);
+            
+            // Create a finished remote iterator that won't make any S3 calls
+            let mut remote = RemoteIter::new("", "", 0, true);
+            remote.state = RemoteIterState::Finished; // Ensure no S3 calls
+            
+            Self {
+                remote,
+                local: LocalIter::new_with_cached(cached_entries),
+                next_remote: None,
+                next_local: None,
+                last_entry: None,
+            }
+        }
+
+        fn extract_cached_entries(inode: &Inode, mut local_entries: VecDeque<ReaddirEntry>) -> VecDeque<ReaddirEntry> {
+            if let Ok(state) = inode.get_inode_state() {
+                if let InodeKindData::Directory { children, .. } = &state.kind_data {
+                    // Convert cached children to ReaddirEntry items, but skip local entries
+                    let mut cached_entries: Vec<_> = children
+                        .values()
+                        .filter_map(|child_inode| {
+                            // Skip children that are in writing_children (local entries)
+                            if local_entries.iter().any(|local| {
+                                if let ReaddirEntry::LocalInode { lookup } = local {
+                                    lookup.inode.ino() == child_inode.ino()
+                                } else {
+                                    false
+                                }
+                            }) {
+                                return None;
+                            }
+
+                            let child_state = child_inode.get_inode_state().ok()?;
+                            match child_inode.kind() {
+                                InodeKind::Directory => Some(ReaddirEntry::RemotePrefix {
+                                    name: child_inode.name().to_string(),
+                                }),
+                                InodeKind::File => Some(ReaddirEntry::RemoteObject {
+                                    name: child_inode.name().to_string(),
+                                    full_key: child_inode.key().to_string(),
+                                    size: child_state.stat.size as u64,
+                                    last_modified: child_state.stat.mtime,
+                                    storage_class: None,
+                                    restore_status: None,
+                                    etag: child_state.stat.etag.as_deref().unwrap_or("").to_string(),
+                                }),
+                            }
+                        })
+                        .collect();
+
+                    cached_entries.sort();
+                    cached_entries.append(&mut local_entries.into_iter().collect());
+                    return cached_entries.into();
+                }
+            }
+            local_entries
+        }
+
         /// Return the next [ReaddirEntry] for the directory stream. If the stream is finished, returns
         /// `Ok(None)`.
         pub(super) async fn next(&mut self, client: &impl ObjectClient) -> Result<Option<ReaddirEntry>, InodeError> {
@@ -518,6 +627,11 @@ mod ordered {
                 }
             }
         }
+
+        /// Check if the remote iteration is complete
+        pub(super) fn is_remote_complete(&self) -> bool {
+            self.remote.state == RemoteIterState::Finished
+        }
     }
 
     /// An iterator over local [ReaddirEntry]s listed from a directory at the start of a [ReaddirHandle]
@@ -528,6 +642,10 @@ mod ordered {
 
     impl LocalIter {
         fn new(entries: VecDeque<ReaddirEntry>) -> Self {
+            Self { entries }
+        }
+
+        fn new_with_cached(entries: VecDeque<ReaddirEntry>) -> Self {
             Self { entries }
         }
 
@@ -583,6 +701,84 @@ mod unordered {
             }
         }
 
+        pub(super) fn new_cached(
+            _bucket: &str,
+            _full_path: &str,
+            _page_size: usize,
+            local_entries: VecDeque<ReaddirEntry>,
+            inode: &Inode,
+        ) -> Self {
+            // Create a cached iterator that uses the children from the inode instead of S3
+            let cached_entries = Self::extract_cached_entries(inode, local_entries);
+            
+            // For unordered cached entries, we need to separate remote entries from local entries
+            let mut remote_iter = RemoteIter::new("", "", 0, false);
+            let mut local_map = HashMap::new();
+            
+            // Populate the remote iterator with cached entries that are remote
+            for entry in cached_entries {
+                match &entry {
+                    ReaddirEntry::LocalInode { lookup } => {
+                        local_map.insert(lookup.inode.name().to_owned(), entry);
+                    },
+                    ReaddirEntry::RemotePrefix { .. } | ReaddirEntry::RemoteObject { .. } => {
+                        remote_iter.entries.push_back(entry);
+                    },
+                }
+            }
+            // Mark the remote iterator as finished since we've populated it with cached data
+            remote_iter.state = RemoteIterState::Finished;
+
+            Self {
+                remote: remote_iter,
+                local: local_map,
+                local_iter: VecDeque::new(),
+            }
+        }
+
+        fn extract_cached_entries(inode: &Inode, mut local_entries: VecDeque<ReaddirEntry>) -> VecDeque<ReaddirEntry> {
+            if let Ok(state) = inode.get_inode_state() {
+                if let InodeKindData::Directory { children, .. } = &state.kind_data {
+                    // Convert cached children to ReaddirEntry items, but skip local entries
+                    let mut cached_entries: Vec<_> = children
+                        .values()
+                        .filter_map(|child_inode| {
+                            // Skip children that are in writing_children (local entries)
+                            if local_entries.iter().any(|local| {
+                                if let ReaddirEntry::LocalInode { lookup } = local {
+                                    lookup.inode.ino() == child_inode.ino()
+                                } else {
+                                    false
+                                }
+                            }) {
+                                return None;
+                            }
+
+                            let child_state = child_inode.get_inode_state().ok()?;
+                            match child_inode.kind() {
+                                InodeKind::Directory => Some(ReaddirEntry::RemotePrefix {
+                                    name: child_inode.name().to_string(),
+                                }),
+                                InodeKind::File => Some(ReaddirEntry::RemoteObject {
+                                    name: child_inode.name().to_string(),
+                                    full_key: child_inode.key().to_string(),
+                                    size: child_state.stat.size as u64,
+                                    last_modified: child_state.stat.mtime,
+                                    storage_class: None,
+                                    restore_status: None,
+                                    etag: child_state.stat.etag.as_deref().unwrap_or("").to_string(),
+                                }),
+                            }
+                        })
+                        .collect();
+
+                    cached_entries.append(&mut local_entries.into_iter().collect());
+                    return cached_entries.into();
+                }
+            }
+            local_entries
+        }
+
         /// Return the next [ReaddirEntry] for the directory stream. If the stream is finished, returns
         /// `Ok(None)`.
         pub(super) async fn next(&mut self, client: &impl ObjectClient) -> Result<Option<ReaddirEntry>, InodeError> {
@@ -596,6 +792,11 @@ mod unordered {
             }
 
             Ok(self.local_iter.pop_front())
+        }
+
+        /// Check if the remote iteration is complete
+        pub(super) fn is_remote_complete(&self) -> bool {
+            self.remote.state == RemoteIterState::Finished
         }
     }
 }
