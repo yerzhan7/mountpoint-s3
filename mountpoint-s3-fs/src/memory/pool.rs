@@ -1,3 +1,4 @@
+use std::future::{Future, ready};
 use std::time::Duration;
 
 use mountpoint_s3_client::config::{MemoryPool, MetaRequestType};
@@ -156,8 +157,9 @@ impl PagedPool {
 impl MemoryPool for PagedPool {
     type Buffer = PoolBuffer;
 
-    fn get_buffer(&self, size: usize, meta_request_type: MetaRequestType) -> Self::Buffer {
-        self.get_buffer(size, meta_request_type.into())
+    fn get_buffer(&self, size: usize, meta_request_type: MetaRequestType) -> impl Future<Output = Self::Buffer> + Send {
+        let buffer = self.get_buffer(size, meta_request_type.into());
+        ready(buffer)
     }
 
     fn trim(&self) -> bool {

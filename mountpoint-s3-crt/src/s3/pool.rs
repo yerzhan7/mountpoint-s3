@@ -1,8 +1,9 @@
 //! Bridge custom memory pool implementations to the CRT S3 Client interface.
 
+use std::future::Future;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::{fmt::Debug, ptr::NonNull};
 
 use mountpoint_s3_crt_sys::{
@@ -15,18 +16,21 @@ use mountpoint_s3_crt_sys::{
 
 use crate::ToAwsByteCursor as _;
 use crate::common::allocator::Allocator;
+use crate::io::event_loop::EventLoopGroup;
+use crate::io::futures::FutureSpawner;
 use crate::s3::client::MetaRequestType;
 
 /// A custom memory pool.
 ///
 /// **WARNING:** The API for this trait is still experimental and will likely change
 /// in future releases.
-pub trait MemoryPool: Clone + Send + Sync {
+pub trait MemoryPool: Clone + Send + Sync + 'static {
     /// Associated buffer type.
-    type Buffer: AsMut<[u8]>;
+    type Buffer: AsMut<[u8]> + Send;
 
     /// Get a buffer of at least the requested size.
-    fn get_buffer(&self, size: usize, meta_request_type: MetaRequestType) -> Self::Buffer;
+    /// Returns a future that resolves to the buffer.
+    fn get_buffer(&self, size: usize, meta_request_type: MetaRequestType) -> impl Future<Output = Self::Buffer> + Send;
 
     /// Trim the pool.
     ///
@@ -87,6 +91,7 @@ struct CrtBufferPoolFactoryInner {
     factory_ptr: NonNull<libc::c_void>,
     factory_fn: aws_s3_buffer_pool_factory_fn,
     drop_fn: fn(*mut ::libc::c_void),
+    event_loop_group: OnceLock<EventLoopGroup>,
 }
 
 // SAFETY: `CrtBufferPoolFactoryInner` is safe to transfer across threads because it wraps a [MemoryPoolFactory] implementation that is [Send].
@@ -113,12 +118,25 @@ impl CrtBufferPoolFactory {
             factory_ptr,
             factory_fn: Some(buffer_pool_factory::<PoolFactory>),
             drop_fn: drop_pool_factory::<PoolFactory>,
+            event_loop_group: OnceLock::new(),
         }))
     }
 
+    /// Set the [EventLoopGroup] to be passed to CrtBufferPool instances created by this factory.
+    ///
+    /// Can be called on any clone of the factory. The first call wins; subsequent calls are ignored.
+    pub fn set_event_loop_group(&self, event_loop_group: EventLoopGroup) {
+        let _ = self.0.event_loop_group.set(event_loop_group);
+    }
+
     /// Returns the factory callback and user_data pointer to pass to the CRT.
+    ///
+    /// The user_data pointer points to the `CrtBufferPoolFactoryInner` so that the
+    /// C callback can access both the pool factory and the [EventLoopGroup].
+    /// The caller MUST keep this `CrtBufferPoolFactory` alive for as long as the CRT
+    /// may invoke the callback.
     pub(crate) fn as_inner(&self) -> (aws_s3_buffer_pool_factory_fn, *mut ::libc::c_void) {
-        (self.0.factory_fn, self.0.factory_ptr.as_ptr())
+        (self.0.factory_fn, Arc::as_ptr(&self.0) as *mut ::libc::c_void)
     }
 }
 
@@ -127,8 +145,18 @@ unsafe extern "C" fn buffer_pool_factory<PoolFactory: MemoryPoolFactory>(
     config: aws_s3_buffer_pool_config,
     user_data: *mut libc::c_void,
 ) -> *mut aws_s3_buffer_pool {
-    // SAFETY: `user_data` references a pinned box owned by the `CrtBufferPoolFactory` instance.
-    let pool_factory = unsafe { &*(user_data as *mut PoolFactory) };
+    // SAFETY: `user_data` points to a `CrtBufferPoolFactoryInner` kept alive by the
+    // `Arc` in `CrtBufferPoolFactory` (held by `ClientConfig`).
+    let factory_inner = unsafe { &*(user_data as *const CrtBufferPoolFactoryInner) };
+
+    // SAFETY: `factory_ptr` references a pinned box owned by the `CrtBufferPoolFactory` instance.
+    let pool_factory = unsafe { &*(factory_inner.factory_ptr.as_ptr() as *mut PoolFactory) };
+
+    let event_loop_group = factory_inner
+        .event_loop_group
+        .get()
+        .cloned()
+        .expect("EventLoopGroup must be set on CrtBufferPoolFactory before creating the CRT client");
 
     // SAFETY: `allocator` is a non-null pointer to a `aws_allocator` instance.
     let allocator = unsafe { NonNull::new_unchecked(allocator).into() };
@@ -140,7 +168,7 @@ unsafe extern "C" fn buffer_pool_factory<PoolFactory: MemoryPoolFactory>(
     };
     let pool = pool_factory.create(options);
 
-    let crt_pool = CrtBufferPool::new(pool.clone(), allocator);
+    let crt_pool = CrtBufferPool::new(pool.clone(), allocator, event_loop_group);
 
     // SAFETY: the CRT will only use the pool through its vtable and refcount.
     unsafe { crt_pool.leak() }
@@ -171,12 +199,14 @@ struct CrtBufferPool<Pool: MemoryPool> {
     ticket_vtable: aws_s3_buffer_ticket_vtable,
     /// CRT allocator.
     allocator: Allocator,
+    /// [EventLoopGroup] for spawning async get_buffer calls.
+    event_loop_group: EventLoopGroup,
     /// Pin this struct because inner.impl_ will be a pointer to this object.
     _pinned: PhantomPinned,
 }
 
 impl<Pool: MemoryPool> CrtBufferPool<Pool> {
-    fn new(pool: Pool, allocator: Allocator) -> Pin<Box<Self>> {
+    fn new(pool: Pool, allocator: Allocator, event_loop_group: EventLoopGroup) -> Pin<Box<Self>> {
         // `inner` will be initialized after pinning because its fields require pinned addresses.
         let mut crt_pool = Box::pin(CrtBufferPool {
             inner: Default::default(),
@@ -194,6 +224,7 @@ impl<Pool: MemoryPool> CrtBufferPool<Pool> {
                 release: None,
             },
             allocator,
+            event_loop_group,
             _pinned: Default::default(),
         });
 
@@ -253,39 +284,19 @@ impl<Pool: MemoryPool> CrtBufferPool<Pool> {
     fn reserve(&self, size: usize, meta_request_type: MetaRequestType) -> CrtTicketFuture {
         let future = CrtTicketFuture::new(&self.allocator);
 
-        // Get a buffer from the pool, build its ticket, and immediately fullfil the future.
-        // This will likely change later, when we make the method on the pool async.
-        let buffer = self.pool.get_buffer(size, meta_request_type);
-        let ticket = self.make_ticket(buffer);
-        future.set(ticket);
+        // Clone what we need for the spawned task
+        let pool = self.pool.clone();
+        let ticket_vtable = self.ticket_vtable;
+        let future_clone = future.clone();
 
-        future
-    }
-
-    fn make_ticket(&self, buffer: Pool::Buffer) -> Pin<Box<CrtTicket<Pool::Buffer>>> {
-        // `inner` will be initialized after pinning because its fields require pinned addresses.
-        let mut ticket = Box::pin(CrtTicket {
-            inner: Default::default(),
-            ticket_vtable: self.ticket_vtable,
-            buffer,
-            _pinned: Default::default(),
+        // Spawn the async get_buffer on the event loop group
+        let _handle = self.event_loop_group.spawn_future(async move {
+            let buffer = pool.get_buffer(size, meta_request_type).await;
+            let ticket = CrtTicket::new(buffer, ticket_vtable);
+            future_clone.set(ticket);
         });
 
-        // Set up the vtable and `impl_` to the pinned addresses (self-referential) and initialize ref-counting.
-        // SAFETY: We're setting up the struct to be self-referential, and we're not moving out
-        // of the struct, so the unchecked deref of the pinned pointer is okay.
-        unsafe {
-            let ticket_ref = Pin::get_unchecked_mut(Pin::as_mut(&mut ticket));
-            ticket_ref.inner.vtable = &raw mut ticket_ref.ticket_vtable;
-            ticket_ref.inner.impl_ = ticket_ref as *mut CrtTicket<Pool::Buffer> as *mut libc::c_void;
-            aws_ref_count_init(
-                &mut ticket_ref.inner.ref_count,
-                &mut ticket_ref.inner as *mut aws_s3_buffer_ticket as *mut libc::c_void,
-                Some(ticket_destroy::<Pool::Buffer>),
-            );
-        }
-
-        ticket
+        future
     }
 }
 
@@ -331,6 +342,32 @@ struct CrtTicket<Buffer: AsMut<[u8]>> {
 }
 
 impl<Buffer: AsMut<[u8]>> CrtTicket<Buffer> {
+    fn new(buffer: Buffer, ticket_vtable: aws_s3_buffer_ticket_vtable) -> Pin<Box<Self>> {
+        // `inner` will be initialized after pinning because its fields require pinned addresses.
+        let mut ticket = Box::pin(CrtTicket {
+            inner: Default::default(),
+            ticket_vtable,
+            buffer,
+            _pinned: Default::default(),
+        });
+
+        // Set up the vtable and `impl_` to the pinned addresses (self-referential) and initialize ref-counting.
+        // SAFETY: We're setting up the struct to be self-referential, and we're not moving out
+        // of the struct, so the unchecked deref of the pinned pointer is okay.
+        unsafe {
+            let ticket_ref = Pin::get_unchecked_mut(Pin::as_mut(&mut ticket));
+            ticket_ref.inner.vtable = &raw mut ticket_ref.ticket_vtable;
+            ticket_ref.inner.impl_ = ticket_ref as *mut CrtTicket<Buffer> as *mut libc::c_void;
+            aws_ref_count_init(
+                &mut ticket_ref.inner.ref_count,
+                &mut ticket_ref.inner as *mut aws_s3_buffer_ticket as *mut libc::c_void,
+                Some(ticket_destroy::<Buffer>),
+            );
+        }
+
+        ticket
+    }
+
     /// Leak a pinned instance and returns a raw pointer.
     ///
     /// # Safety

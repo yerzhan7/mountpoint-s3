@@ -440,6 +440,7 @@ impl S3CrtClientInner {
         client_config.memory_limit_in_bytes(config.memory_limit_in_bytes);
 
         if let Some(pool_factory) = &config.buffer_pool_factory {
+            pool_factory.set_event_loop_group(event_loop_group.clone());
             client_config.buffer_pool_factory(pool_factory.clone());
         }
 
