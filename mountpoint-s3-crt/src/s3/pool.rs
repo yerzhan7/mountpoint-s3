@@ -1,6 +1,6 @@
 //! Bridge custom memory pool implementations to the CRT S3 Client interface.
 
-use std::future::Future;
+use std::future::{Future, ready};
 use std::marker::PhantomPinned;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
@@ -29,8 +29,20 @@ pub trait MemoryPool: Clone + Send + Sync + 'static {
     type Buffer: AsMut<[u8]> + Send;
 
     /// Get a buffer of at least the requested size.
+    fn get_buffer(&self, size: usize, meta_request_type: MetaRequestType) -> Self::Buffer;
+
+    /// Get a buffer of at least the requested size asynchronously.
     /// Returns a future that resolves to the buffer.
-    fn get_buffer(&self, size: usize, meta_request_type: MetaRequestType) -> impl Future<Output = Self::Buffer> + Send;
+    ///
+    /// The default implementation wraps [`get_buffer`](Self::get_buffer) in a
+    /// ready future. Override this when the pool needs to wait for memory to free up.
+    fn get_buffer_async(
+        &self,
+        size: usize,
+        meta_request_type: MetaRequestType,
+    ) -> impl Future<Output = Self::Buffer> + Send {
+        ready(self.get_buffer(size, meta_request_type))
+    }
 
     /// Trim the pool.
     ///
@@ -281,20 +293,27 @@ impl<Pool: MemoryPool> CrtBufferPool<Pool> {
         self.pool.trim();
     }
 
-    fn reserve(&self, size: usize, meta_request_type: MetaRequestType) -> CrtTicketFuture {
+    fn reserve(&self, size: usize, meta_request_type: MetaRequestType, can_block: bool) -> CrtTicketFuture {
         let future = CrtTicketFuture::new(&self.allocator);
 
-        // Clone what we need for the spawned task
         let pool = self.pool.clone();
         let ticket_vtable = self.ticket_vtable;
         let future_clone = future.clone();
 
-        // Spawn the async get_buffer on the event loop group
-        let _handle = self.event_loop_group.spawn_future(async move {
-            let buffer = pool.get_buffer(size, meta_request_type).await;
+        if can_block {
+            // The write path in s3_meta_request.c expects the ticket to be fulfilled
+            // synchronously — it treats an unfulfilled future as error.
+            let buffer = pool.get_buffer(size, meta_request_type);
             let ticket = CrtTicket::new(buffer, ticket_vtable);
             future_clone.set(ticket);
-        });
+        } else {
+            // Read path: spawn on background thread, return unfulfilled future.
+            let _handle = self.event_loop_group.spawn_future(async move {
+                let buffer = pool.get_buffer_async(size, meta_request_type).await;
+                let ticket = CrtTicket::new(buffer, ticket_vtable);
+                future_clone.set(ticket);
+            });
+        }
 
         future
     }
@@ -310,7 +329,7 @@ unsafe extern "C" fn pool_reserve<Pool: MemoryPool>(
     // SAFETY: `meta.meta_request` is a pointer to a valid `aws_s3_meta_request`.
     let request_type = unsafe { (*meta.meta_request).type_ };
 
-    let future = crt_pool.reserve(meta.size, request_type.into());
+    let future = crt_pool.reserve(meta.size, request_type.into(), meta.can_block);
 
     // SAFETY: the CRT will take ownership of the future.
     unsafe { future.into_inner_ptr() }

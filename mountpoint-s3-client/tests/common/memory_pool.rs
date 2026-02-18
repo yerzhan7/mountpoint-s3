@@ -1,5 +1,3 @@
-use std::future::{Future, ready};
-
 use mountpoint_s3_client::config::{MemoryPool, MetaRequestType};
 
 /// Creates a memory pool to use in tests.
@@ -14,8 +12,8 @@ struct NoReusePool();
 impl MemoryPool for NoReusePool {
     type Buffer = Box<[u8]>;
 
-    fn get_buffer(&self, size: usize, _type: MetaRequestType) -> impl Future<Output = Self::Buffer> + Send {
-        ready(vec![0u8; size].into_boxed_slice())
+    fn get_buffer(&self, size: usize, _type: MetaRequestType) -> Self::Buffer {
+        vec![0u8; size].into_boxed_slice()
     }
 
     fn trim(&self) -> bool {
