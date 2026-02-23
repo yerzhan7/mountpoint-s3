@@ -295,19 +295,18 @@ impl<Pool: MemoryPool> CrtBufferPool<Pool> {
 
     fn reserve(&self, size: usize, meta_request_type: MetaRequestType, can_block: bool) -> CrtTicketFuture {
         let future = CrtTicketFuture::new(&self.allocator);
-
-        let pool = self.pool.clone();
         let ticket_vtable = self.ticket_vtable;
-        let future_clone = future.clone();
 
         if can_block {
             // The write path in s3_meta_request.c expects the ticket to be fulfilled
             // synchronously — it treats an unfulfilled future as error.
-            let buffer = pool.get_buffer(size, meta_request_type);
+            let buffer = self.pool.get_buffer(size, meta_request_type);
             let ticket = CrtTicket::new(buffer, ticket_vtable);
-            future_clone.set(ticket);
+            future.set(ticket);
         } else {
             // Read path: spawn on background thread, return unfulfilled future.
+            let pool = self.pool.clone();
+            let future_clone = future.clone();
             let _handle = self.event_loop_group.spawn_future(async move {
                 let buffer = pool.get_buffer_async(size, meta_request_type).await;
                 let ticket = CrtTicket::new(buffer, ticket_vtable);
