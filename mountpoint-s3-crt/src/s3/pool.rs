@@ -3,7 +3,7 @@
 use std::future::{Future, ready};
 use std::marker::PhantomPinned;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::{fmt::Debug, ptr::NonNull};
 
 use mountpoint_s3_crt_sys::{
@@ -33,6 +33,10 @@ pub trait MemoryPool: Clone + Send + Sync + 'static {
 
     /// Get a buffer of at least the requested size asynchronously.
     /// Returns a future that resolves to the buffer.
+    ///
+    /// Implementations must always eventually resolve. If memory is not immediately
+    /// available, the implementation should block/await until it is — not panic or
+    /// deadlock.
     ///
     /// The default implementation wraps [`get_buffer`](Self::get_buffer) in a
     /// ready future. Override this when the pool needs to wait for memory to free up.
@@ -94,31 +98,42 @@ impl MemoryPoolFactoryOptions {
     }
 }
 
-/// Factory used by [Client](`super::client::Client`) to create CRT wrappers for [MemoryPool] implementations.
+/// Type-erased wrapper around a [MemoryPoolFactory] implementation.
+///
+/// This wrapper stores the factory in a type-erased form so it can be held
+/// in non-generic structs like `S3ClientConfig`. The concrete type information
+/// is preserved via function pointers for later use when constructing the
+/// CRT bridge ([`CrtBufferPoolFactory`]).
 #[derive(Debug, Clone)]
-pub struct CrtBufferPoolFactory(Arc<CrtBufferPoolFactoryInner>);
+pub struct MemoryPoolFactoryWrapper(Arc<MemoryPoolFactoryWrapperInner>);
 
 #[derive(Debug)]
-struct CrtBufferPoolFactoryInner {
+struct MemoryPoolFactoryWrapperInner {
+    /// Pointer to the leaked (pinned) [MemoryPoolFactory] implementation.
     factory_ptr: NonNull<libc::c_void>,
+    /// The generic C callback function pointer for `buffer_pool_factory::<PoolFactory>`.
     factory_fn: aws_s3_buffer_pool_factory_fn,
-    drop_fn: fn(*mut ::libc::c_void),
-    event_loop_group: OnceLock<EventLoopGroup>,
+    /// Function pointer to drop the leaked factory.
+    drop_fn: fn(*mut libc::c_void),
 }
 
-// SAFETY: `CrtBufferPoolFactoryInner` is safe to transfer across threads because it wraps a [MemoryPoolFactory] implementation that is [Send].
-unsafe impl Send for CrtBufferPoolFactoryInner {}
-// SAFETY: `CrtBufferPoolFactoryInner` is safe to share across threads because it wraps a [MemoryPoolFactory] implementation that is [Sync].
-unsafe impl Sync for CrtBufferPoolFactoryInner {}
+// SAFETY: `MemoryPoolFactoryWrapperInner` is safe to transfer across threads because it wraps a [MemoryPoolFactory] implementation that is [Send].
+unsafe impl Send for MemoryPoolFactoryWrapperInner {}
+// SAFETY: `MemoryPoolFactoryWrapperInner` is safe to share across threads because it wraps a [MemoryPoolFactory] implementation that is [Sync].
+unsafe impl Sync for MemoryPoolFactoryWrapperInner {}
 
-impl Drop for CrtBufferPoolFactoryInner {
+impl Drop for MemoryPoolFactoryWrapperInner {
     fn drop(&mut self) {
         (self.drop_fn)(self.factory_ptr.as_ptr());
     }
 }
 
-impl CrtBufferPoolFactory {
-    /// Builds a factory for the given pool.
+impl MemoryPoolFactoryWrapper {
+    /// Create a new wrapper from a [MemoryPoolFactory] implementation.
+    ///
+    /// The factory is pinned and leaked into a type-erased pointer, preserving
+    /// the concrete type information via function pointers for later use by
+    /// [`CrtBufferPoolFactory`].
     pub fn new<PoolFactory: MemoryPoolFactory>(pool_factory: PoolFactory) -> Self {
         let factory = Box::pin(pool_factory);
         // SAFETY: The pointer to the factory will only be used in `buffer_pool_factory` and
@@ -126,19 +141,58 @@ impl CrtBufferPoolFactory {
         let leaked = Box::leak(unsafe { Pin::into_inner_unchecked(factory) });
         // SAFETY: `leaked` is not null.
         let factory_ptr = unsafe { NonNull::new_unchecked(leaked as *mut PoolFactory as *mut libc::c_void) };
-        Self(Arc::new(CrtBufferPoolFactoryInner {
+        Self(Arc::new(MemoryPoolFactoryWrapperInner {
             factory_ptr,
             factory_fn: Some(buffer_pool_factory::<PoolFactory>),
             drop_fn: drop_pool_factory::<PoolFactory>,
-            event_loop_group: OnceLock::new(),
         }))
     }
 
-    /// Set the [EventLoopGroup] to be passed to CrtBufferPool instances created by this factory.
+    /// Returns the factory pointer.
+    pub(crate) fn factory_ptr(&self) -> NonNull<libc::c_void> {
+        self.0.factory_ptr
+    }
+
+    /// Returns the C callback function pointer.
+    pub(crate) fn factory_fn(&self) -> aws_s3_buffer_pool_factory_fn {
+        self.0.factory_fn
+    }
+}
+
+/// Factory used by [Client](`super::client::Client`) to create CRT wrappers for [MemoryPool] implementations.
+#[derive(Debug, Clone)]
+pub struct CrtBufferPoolFactory(Arc<CrtBufferPoolFactoryInner>);
+
+#[derive(Debug)]
+struct CrtBufferPoolFactoryInner {
+    /// Copied from the wrapper for direct access in the C callback
+    /// (the callback receives a pointer to this struct as `user_data`).
+    factory_ptr: NonNull<libc::c_void>,
+    factory_fn: aws_s3_buffer_pool_factory_fn,
+    event_loop_group: EventLoopGroup,
+    /// Keeps the wrapper alive so its `Drop` impl frees the factory pointer exactly once.
+    _wrapper: MemoryPoolFactoryWrapper,
+}
+
+// SAFETY: `CrtBufferPoolFactoryInner` is safe to transfer across threads because it wraps a [MemoryPoolFactory] implementation that is [Send].
+unsafe impl Send for CrtBufferPoolFactoryInner {}
+// SAFETY: `CrtBufferPoolFactoryInner` is safe to share across threads because it wraps a [MemoryPoolFactory] implementation that is [Sync].
+unsafe impl Sync for CrtBufferPoolFactoryInner {}
+
+impl CrtBufferPoolFactory {
+    /// Builds a CRT buffer pool factory from a type-erased wrapper and an [EventLoopGroup].
     ///
-    /// Can be called on any clone of the factory. The first call wins; subsequent calls are ignored.
-    pub fn set_event_loop_group(&self, event_loop_group: EventLoopGroup) {
-        let _ = self.0.event_loop_group.set(event_loop_group);
+    /// The wrapper provides the type-erased factory pointer and C callback.
+    /// The [EventLoopGroup] is stored directly and passed to each [`CrtBufferPool`].
+    pub fn new(wrapper: MemoryPoolFactoryWrapper, event_loop_group: EventLoopGroup) -> Self {
+        let factory_ptr = wrapper.factory_ptr();
+        let factory_fn = wrapper.factory_fn();
+        Self(Arc::new(CrtBufferPoolFactoryInner {
+            factory_ptr,
+            factory_fn,
+            event_loop_group,
+            _wrapper: wrapper,
+        }))
     }
 
     /// Returns the factory callback and user_data pointer to pass to the CRT.
@@ -164,11 +218,7 @@ unsafe extern "C" fn buffer_pool_factory<PoolFactory: MemoryPoolFactory>(
     // SAFETY: `factory_ptr` references a pinned box owned by the `CrtBufferPoolFactory` instance.
     let pool_factory = unsafe { &*(factory_inner.factory_ptr.as_ptr() as *mut PoolFactory) };
 
-    let event_loop_group = factory_inner
-        .event_loop_group
-        .get()
-        .cloned()
-        .expect("EventLoopGroup must be set on CrtBufferPoolFactory before creating the CRT client");
+    let event_loop_group = factory_inner.event_loop_group.clone();
 
     // SAFETY: `allocator` is a non-null pointer to a `aws_allocator` instance.
     let allocator = unsafe { NonNull::new_unchecked(allocator).into() };
@@ -187,7 +237,7 @@ unsafe extern "C" fn buffer_pool_factory<PoolFactory: MemoryPoolFactory>(
 }
 
 fn drop_pool_factory<PoolFactory: MemoryPoolFactory>(factory_ptr: *mut libc::c_void) {
-    // SAFETY: `factory_ptr` was leaked in `CrtBufferPoolFactory::new`.
+    // SAFETY: `factory_ptr` was leaked in `MemoryPoolFactoryWrapper::new`.
     _ = unsafe { Pin::new_unchecked(Box::from_raw(factory_ptr as *mut PoolFactory)) };
 }
 
@@ -307,6 +357,14 @@ impl<Pool: MemoryPool> CrtBufferPool<Pool> {
             // Read path: spawn on background thread, return unfulfilled future.
             let pool = self.pool.clone();
             let future_clone = future.clone();
+            // Dropping the handle is intentional: if the CRT cancels the meta request
+            // while the task is in flight, the buffer will be allocated (eventually) and
+            // set on an already-done future — the CRT handles this safely by destroying
+            // the ticket via `s_future_impl_result_dtor`. This results in a wasted
+            // allocation that is immediately freed, but no leak or error.
+            // TODO: The CRT does not currently provide a cancellation mechanism for
+            // in-flight ticket futures. If one is added, we could propagate it to
+            // `get_buffer_async` to avoid the wasteful buffer allocation.
             let _handle = self.event_loop_group.spawn_future(async move {
                 let buffer = pool.get_buffer_async(size, meta_request_type).await;
                 let ticket = CrtTicket::new(buffer, ticket_vtable);
