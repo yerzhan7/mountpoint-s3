@@ -1,0 +1,12 @@
+# ST-1: No Starvation Under Pressure
+# 20 concurrent sequential reads of 10 GiB objects, max_memory_target=512 MiB
+# Container: --memory=1g --memory-swap=1g
+# Pass: no OOM, every job has total_bytes > 0, zero errors
+
+[jobs.seq_read]
+numjobs = 20
+workload_type = "read"
+object_key = "benchmark/mem-limit/st1.bin"
+object_size = 10737418240  # 10 GiB
+access_pattern = "sequential"
+iterations = 1

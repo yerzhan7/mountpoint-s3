@@ -1,0 +1,10 @@
+# ST-2a: Graceful Degradation — baseline (2 concurrent readers)
+# max_memory_target=1024 MiB, Container: --memory=2g --memory-swap=2g
+
+[jobs.seq_read]
+numjobs = 2
+workload_type = "read"
+object_key = "benchmark/mem-limit/st2.bin"
+object_size = 10737418240  # 10 GiB
+access_pattern = "sequential"
+iterations = 1

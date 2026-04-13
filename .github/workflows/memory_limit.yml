@@ -1,0 +1,239 @@
+name: Memory Limit Stress Tests
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+  S3_BUCKET_NAME: ${{ vars.S3_BENCH_BUCKET_NAME }}
+  S3_REGION: ${{ vars.S3_BENCH_REGION }}
+
+jobs:
+  build:
+    name: Build s3io_benchmark
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Install operating system dependencies
+        uses: ./.github/actions/install-dependencies
+        with:
+          fuseVersion: 2
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Build s3io_benchmark with mem_limiter feature
+        run: |
+          cargo build --release --example s3io_benchmark \
+            --features mem_limiter \
+            --package mountpoint-s3-fs
+
+      - name: Upload benchmark binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3io-benchmark-binary
+          path: target/release/examples/s3io_benchmark
+          retention-days: 1
+
+  stress-test:
+    name: "${{ matrix.scenario.name }}"
+    runs-on: ubuntu-latest
+    needs: build
+    container:
+      image: ubuntu:24.04
+      options: >-
+        --memory=${{ matrix.scenario.container_memory }}
+        --memory-swap=${{ matrix.scenario.container_memory }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - name: "ST-1: No Starvation (512 MiB / 1g)"
+            config: st1_no_starvation.toml
+            container_memory: "1g"
+            max_memory_target: 512
+            validate_all_jobs_have_bytes: true
+            validate_zero_errors: true
+
+          - name: "ST-2a: Graceful Degradation (2 jobs / 1024 MiB / 2g)"
+            config: st2a_graceful_2jobs.toml
+            container_memory: "2g"
+            max_memory_target: 1024
+            validate_all_jobs_have_bytes: true
+            validate_zero_errors: true
+
+          - name: "ST-2b: Graceful Degradation (8 jobs / 1024 MiB / 2g)"
+            config: st2b_graceful_8jobs.toml
+            container_memory: "2g"
+            max_memory_target: 1024
+            validate_all_jobs_have_bytes: true
+            validate_zero_errors: true
+
+          - name: "ST-2c: Graceful Degradation (32 jobs / 1024 MiB / 2g)"
+            config: st2c_graceful_32jobs.toml
+            container_memory: "2g"
+            max_memory_target: 1024
+            validate_all_jobs_have_bytes: true
+            validate_zero_errors: true
+
+          - name: "ST-4: Mixed Read/Write (768 MiB / 1280m)"
+            config: st4_mixed_rw.toml
+            container_memory: "1280m"
+            max_memory_target: 768
+            validate_all_jobs_have_bytes: true
+            validate_zero_errors: true
+
+          - name: "ST-6: Minimum Limit (512 MiB / 768m)"
+            config: st6_minimum_limit.toml
+            container_memory: "768m"
+            max_memory_target: 512
+            validate_all_jobs_have_bytes: true
+            validate_zero_errors: true
+            max_peak_memory_mib: 650
+
+          - name: "ST-8: Incremental Upload (768 MiB / 1280m)"
+            config: st8_incremental_upload.toml
+            container_memory: "1280m"
+            max_memory_target: 768
+            validate_all_jobs_have_bytes: true
+            validate_zero_errors: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.ACTIONS_BENCH_IAM_ROLE }}
+          aws-region: ${{ vars.S3_BENCH_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Download benchmark binary
+        uses: actions/download-artifact@v4
+        with:
+          name: s3io-benchmark-binary
+          path: /tmp/bench
+
+      - name: Make binary executable
+        run: chmod +x /tmp/bench/s3io_benchmark
+
+      - name: Generate benchmark config
+        run: |
+          printf '[global]\nbucket = "%s"\nregion = "%s"\nmax_memory_target = %d\noutput_file = "/tmp/bench/results.json"\n\n' \
+            "${S3_BUCKET_NAME}" "${S3_REGION}" "${{ matrix.scenario.max_memory_target }}" \
+            > /tmp/bench/config.toml
+
+          cat .github/memory-limit-configs/${{ matrix.scenario.config }} >> /tmp/bench/config.toml
+
+          echo "=== Generated config ==="
+          cat /tmp/bench/config.toml
+
+      - name: Install container dependencies
+        run: apt-get update -qq && apt-get install -y -qq ca-certificates > /dev/null
+
+      - name: Run stress test
+        run: /tmp/bench/s3io_benchmark /tmp/bench/config.toml
+
+      - name: Validate results
+        if: always()
+        run: |
+          RESULTS="/tmp/bench/results.json"
+
+          if [ ! -f "$RESULTS" ]; then
+            echo "ERROR: Results file not found — benchmark may have been OOM-killed"
+            exit 1
+          fi
+
+          echo "=== Benchmark Results ==="
+          cat "$RESULTS"
+          echo ""
+
+          apt-get update -qq && apt-get install -y -qq jq bc > /dev/null
+
+          TOTAL_BYTES=$(jq '.summary.total_bytes' "$RESULTS")
+          TOTAL_ERRORS=$(jq '.summary.total_errors' "$RESULTS")
+          PEAK_MEMORY=$(jq '.summary.peak_memory_mib' "$RESULTS")
+          NUM_JOBS=$(jq '.jobs | length' "$RESULTS")
+
+          echo "Summary: ${NUM_JOBS} jobs, ${TOTAL_BYTES} bytes, ${TOTAL_ERRORS} errors, peak memory ${PEAK_MEMORY} MiB"
+
+          FAILED=0
+
+          if [ "${{ matrix.scenario.validate_all_jobs_have_bytes }}" = "true" ]; then
+            ZERO_BYTE_JOBS=$(jq '[.jobs[] | select(.total_bytes == 0)] | length' "$RESULTS")
+            if [ "$ZERO_BYTE_JOBS" -gt 0 ]; then
+              echo "FAIL: ${ZERO_BYTE_JOBS} job(s) transferred zero bytes (starvation detected)"
+              jq '.jobs[] | select(.total_bytes == 0) | .job_name' "$RESULTS"
+              FAILED=1
+            else
+              echo "PASS: All jobs transferred data"
+            fi
+          fi
+
+          if [ "${{ matrix.scenario.validate_zero_errors }}" = "true" ]; then
+            if [ "$TOTAL_ERRORS" -gt 0 ]; then
+              echo "FAIL: ${TOTAL_ERRORS} error(s) detected"
+              jq '.jobs[] | select((.errors | length) > 0) | {job_name, errors}' "$RESULTS"
+              FAILED=1
+            else
+              echo "PASS: Zero errors"
+            fi
+          fi
+
+          MAX_PEAK="${{ matrix.scenario.max_peak_memory_mib }}"
+          if [ -n "$MAX_PEAK" ]; then
+            OVER=$(echo "$PEAK_MEMORY > $MAX_PEAK" | bc -l)
+            if [ "$OVER" -eq 1 ]; then
+              echo "FAIL: Peak memory ${PEAK_MEMORY} MiB exceeds limit ${MAX_PEAK} MiB"
+              FAILED=1
+            else
+              echo "PASS: Peak memory ${PEAK_MEMORY} MiB within ${MAX_PEAK} MiB ceiling"
+            fi
+          fi
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo ""
+            echo "One or more validations failed"
+            exit 1
+          fi
+
+          echo ""
+          echo "All validations passed"
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-limit-results-${{ strategy.job-index }}
+          path: /tmp/bench/results.json
+          retention-days: 7
+
+  workflow-complete:
+    name: "Memory Limit Tests Complete"
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - stress-test
+    steps:
+      - name: Verify all stress tests passed
+        run: |
+          echo '${{ toJSON(needs) }}' | jq -e 'to_entries | all(.value.result == "success")'

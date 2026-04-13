@@ -1,0 +1,18 @@
+# ST-8: Incremental Upload Under Memory Pressure
+# 8 concurrent incremental uploads of 1 GiB + 4 concurrent sequential reads
+# max_memory_target=768 MiB, Container: --memory=1280m --memory-swap=1280m
+
+[jobs.seq_read]
+numjobs = 4
+workload_type = "read"
+object_key = "benchmark/mem-limit/st8-read.bin"
+object_size = 10737418240  # 10 GiB
+access_pattern = "sequential"
+iterations = 1
+
+[jobs.incr_upload]
+numjobs = 8
+workload_type = "write"
+object_key = "benchmark/mem-limit/st8-write.bin"
+object_size = 1073741824  # 1 GiB
+incremental_upload = true

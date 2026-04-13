@@ -1,0 +1,12 @@
+# ST-6: Minimum Memory Limit (MINIMUM_MEM_LIMIT = 512 MiB)
+# 4 concurrent sequential reads of 10 GiB objects, max_memory_target=512 MiB
+# Container: --memory=768m --memory-swap=768m
+# Pass: no OOM, all jobs complete, peak memory <= 650 MiB
+
+[jobs.seq_read]
+numjobs = 4
+workload_type = "read"
+object_key = "benchmark/mem-limit/st6.bin"
+object_size = 10737418240  # 10 GiB
+access_pattern = "sequential"
+iterations = 1

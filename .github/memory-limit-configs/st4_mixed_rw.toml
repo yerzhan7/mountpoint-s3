@@ -1,0 +1,17 @@
+# ST-4: Mixed Read/Write Under Pressure
+# 10 concurrent sequential reads + 4 concurrent writes, max_memory_target=768 MiB
+# Container: --memory=1280m --memory-swap=1280m
+
+[jobs.seq_read]
+numjobs = 10
+workload_type = "read"
+object_key = "benchmark/mem-limit/st4-read.bin"
+object_size = 10737418240  # 10 GiB
+access_pattern = "sequential"
+iterations = 1
+
+[jobs.write]
+numjobs = 4
+workload_type = "write"
+object_key = "benchmark/mem-limit/st4-write.bin"
+object_size = 1073741824  # 1 GiB
