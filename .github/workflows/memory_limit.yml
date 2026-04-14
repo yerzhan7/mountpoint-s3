@@ -64,53 +64,46 @@ jobs:
       fail-fast: false
       matrix:
         scenario:
-          - name: "ST-1: No Starvation (512 MiB / 1g)"
+          - name: "ST-1: No Starvation (1g)"
             config: st1_no_starvation.toml
             container_memory: "1g"
-            max_memory_target: 512
             validate_all_jobs_have_bytes: true
             validate_zero_errors: true
 
-          - name: "ST-2a: Graceful Degradation (2 jobs / 1024 MiB / 2g)"
+          - name: "ST-2a: Graceful Degradation (2 jobs / 2g)"
             config: st2a_graceful_2jobs.toml
             container_memory: "2g"
-            max_memory_target: 1024
             validate_all_jobs_have_bytes: true
             validate_zero_errors: true
 
-          - name: "ST-2b: Graceful Degradation (8 jobs / 1024 MiB / 2g)"
+          - name: "ST-2b: Graceful Degradation (8 jobs / 2g)"
             config: st2b_graceful_8jobs.toml
             container_memory: "2g"
-            max_memory_target: 1024
             validate_all_jobs_have_bytes: true
             validate_zero_errors: true
 
-          - name: "ST-2c: Graceful Degradation (32 jobs / 1024 MiB / 2g)"
+          - name: "ST-2c: Graceful Degradation (32 jobs / 2g)"
             config: st2c_graceful_32jobs.toml
             container_memory: "2g"
-            max_memory_target: 1024
             validate_all_jobs_have_bytes: true
             validate_zero_errors: true
 
-          - name: "ST-4: Mixed Read/Write (768 MiB / 1280m)"
+          - name: "ST-4: Mixed Read/Write (1280m)"
             config: st4_mixed_rw.toml
             container_memory: "1280m"
-            max_memory_target: 768
             validate_all_jobs_have_bytes: true
             validate_zero_errors: true
 
-          - name: "ST-6: Minimum Limit (512 MiB / 768m)"
+          - name: "ST-6: Minimum Limit (768m)"
             config: st6_minimum_limit.toml
             container_memory: "768m"
-            max_memory_target: 512
             validate_all_jobs_have_bytes: true
             validate_zero_errors: true
             max_peak_memory_mib: 650
 
-          - name: "ST-8: Incremental Upload (768 MiB / 1280m)"
+          - name: "ST-8: Incremental Upload (1280m)"
             config: st8_incremental_upload.toml
             container_memory: "1280m"
-            max_memory_target: 768
             validate_all_jobs_have_bytes: true
             validate_zero_errors: true
 
@@ -136,10 +129,16 @@ jobs:
       - name: Make binary executable
         run: chmod +x /tmp/bench/s3io_benchmark
 
+      - name: Log container memory limits
+        run: |
+          echo "=== Container cgroup memory info ==="
+          echo "cgroup v2 memory.max: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo 'N/A')"
+          echo "cgroup v1 memory.limit_in_bytes: $(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo 'N/A')"
+
       - name: Generate benchmark config
         run: |
-          printf '[global]\nbucket = "%s"\nregion = "%s"\nmax_memory_target = %d\noutput_file = "/tmp/bench/results.json"\n\n' \
-            "${S3_BUCKET_NAME}" "${S3_REGION}" "${{ matrix.scenario.max_memory_target }}" \
+          printf '[global]\nbucket = "%s"\nregion = "%s"\noutput_file = "/tmp/bench/results.json"\n\n' \
+            "${S3_BUCKET_NAME}" "${S3_REGION}" \
             > /tmp/bench/config.toml
 
           cat .github/memory-limit-configs/${{ matrix.scenario.config }} >> /tmp/bench/config.toml

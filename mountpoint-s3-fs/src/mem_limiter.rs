@@ -2,11 +2,40 @@ use std::{sync::atomic::Ordering, time::Instant};
 
 use humansize::make_format;
 use metrics::atomics::AtomicU64;
+use sysinfo::{MemoryRefreshKind, System};
 use tracing::{debug, trace};
 
 use crate::memory::{BufferKind, PagedPool};
 
 pub const MINIMUM_MEM_LIMIT: u64 = 512 * 1024 * 1024;
+
+/// Returns the effective total memory available to this process, taking into account
+/// cgroup memory limits (v2 and v1) when running inside a container.
+///
+/// Uses `sysinfo::System::cgroup_limits()` which handles cgroup v1/v2 detection,
+/// mount point resolution, and path parsing internally. On non-Linux systems or
+/// when no cgroup limit is set, falls back to total system memory.
+pub fn effective_total_memory() -> u64 {
+    let mut sys = System::new();
+    sys.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+
+    let total = match sys.cgroup_limits() {
+        Some(limits) => {
+            debug!(
+                cgroup_limit = limits.total_memory,
+                system_total = sys.total_memory(),
+                "detected cgroup memory limit"
+            );
+            limits.total_memory
+        }
+        None => {
+            let system_total = sys.total_memory();
+            debug!(system_total, "no cgroup memory limit detected; using system total memory");
+            system_total
+        }
+    };
+    total
+}
 
 /// Buffer areas that can be managed by the memory limiter. This is used for updating metrics.
 #[derive(Debug)]
