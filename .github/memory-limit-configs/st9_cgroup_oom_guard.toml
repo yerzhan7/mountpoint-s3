@@ -1,0 +1,15 @@
+# ST-9: Cgroup OOM Guard
+# Verifies that the memory limiter auto-detects the container's cgroup limit
+# and prevents OOM. Without cgroup awareness, the limiter would target 95% of
+# host memory (~6+ GiB on GH runners), far exceeding the 512m container limit.
+# 8 concurrent sequential reads of 10 GiB objects with no explicit max_memory_target.
+# Container: --memory=512m --memory-swap=512m
+# Pass: no OOM (results file exists), all jobs complete
+
+[jobs.seq_read]
+numjobs = 8
+workload_type = "read"
+object_key = "benchmark/mem-limit/st9.bin"
+object_size = 10737418240  # 10 GiB
+access_pattern = "sequential"
+iterations = 1

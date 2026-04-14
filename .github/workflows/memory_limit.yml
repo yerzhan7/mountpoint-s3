@@ -107,6 +107,12 @@ jobs:
             validate_all_jobs_have_bytes: true
             validate_zero_errors: true
 
+          - name: "ST-9: Cgroup OOM Guard (512m)"
+            config: st9_cgroup_oom_guard.toml
+            container_memory: "512m"
+            validate_all_jobs_have_bytes: true
+            validate_zero_errors: false
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
