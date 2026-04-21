@@ -16,9 +16,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::common::fuse::{self, TestSession, TestSessionConfig};
+use crate::common::stress_recorder;
+use crate::common::test_recorder::TestRecorder;
 
 /// Default scenario duration if `STRESS_DURATION_SECS` is unset.
 const DEFAULT_DURATION_SECS: u64 = 60;
+
+/// Default metrics-logger interval if `STRESS_METRICS_INTERVAL_SECS` is unset.
+const DEFAULT_METRICS_INTERVAL_SECS: u64 = 10;
 
 /// How long to wait for worker threads to join after signalling stop.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -28,6 +33,9 @@ const WATCHDOG_POLL: Duration = Duration::from_secs(1);
 
 /// Sentinel value meaning "no stall detected".
 const NO_STALL: usize = usize::MAX;
+
+/// At teardown, total `mem.bytes_reserved` across areas must be at or below this many bytes.
+const TEARDOWN_RESERVED_SLACK_BYTES: f64 = 1.0 * 1024.0 * 1024.0;
 
 /// A stress-test scenario. Implementations describe a load shape; the harness drives it.
 pub trait Scenario: Send + Sync {
@@ -56,7 +64,12 @@ pub trait Scenario: Send + Sync {
 
 /// Run the given scenario. Reads `STRESS_DURATION_SECS` from env; default 60s.
 pub fn run<S: Scenario + 'static>(scenario: S) {
+    // Make sure the snapshotting recorder is installed even if the common-module ctor has not
+    // run yet (nextest uses a fresh process per test).
+    stress_recorder::install();
+
     let duration = read_duration_env();
+    let metrics_interval = read_metrics_interval_env();
     let scenario = Arc::new(scenario);
 
     tracing::info!(
@@ -64,6 +77,7 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
         duration_secs = duration.as_secs(),
         workers = scenario.num_workers(),
         max_idle_secs = scenario.max_idle_duration().as_secs(),
+        metrics_interval_secs = metrics_interval.as_secs(),
         "stress: starting"
     );
 
@@ -94,6 +108,7 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
         stop.clone(),
         stalled_worker.clone(),
     );
+    let metrics_logger = spawn_metrics_logger(scenario.name().to_string(), metrics_interval, stop.clone());
 
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
@@ -106,6 +121,7 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
     if let Some(wd) = watchdog {
         let _ = wd.join();
     }
+    let _ = metrics_logger.join();
 
     let join_deadline = Instant::now() + JOIN_TIMEOUT;
     for (id, handle) in handles.into_iter().enumerate() {
@@ -134,6 +150,8 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
             scenario.max_idle_duration()
         );
     }
+
+    assert_teardown_invariants(scenario.name());
 
     tracing::info!(scenario = scenario.name(), "stress: finished");
 }
@@ -186,6 +204,88 @@ fn read_duration_env() -> Duration {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_DURATION_SECS);
     Duration::from_secs(secs)
+}
+
+fn read_metrics_interval_env() -> Duration {
+    let secs = std::env::var("STRESS_METRICS_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_METRICS_INTERVAL_SECS);
+    Duration::from_secs(secs)
+}
+
+fn spawn_metrics_logger(
+    scenario_name: String,
+    interval: Duration,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            // Sleep in small slices so we notice stop promptly.
+            let mut remaining = interval;
+            let slice = Duration::from_millis(200);
+            while remaining > Duration::ZERO && !stop.load(Ordering::Relaxed) {
+                let s = slice.min(remaining);
+                thread::sleep(s);
+                remaining = remaining.saturating_sub(s);
+            }
+            log_mem_metrics(&scenario_name);
+        }
+    })
+}
+
+/// Log the current `mem.bytes_reserved` gauges (per area). Extend this list as the memory
+/// limiter registers richer metrics (allocation queue depth, pruning counters, etc.).
+fn log_mem_metrics(scenario_name: &str) {
+    let Some(recorder) = stress_recorder::recorder() else {
+        return;
+    };
+    for (area, total) in read_mem_bytes_reserved(recorder) {
+        tracing::info!(
+            scenario = scenario_name,
+            metric = "mem.bytes_reserved",
+            area,
+            value = total,
+            "stress: metric",
+        );
+    }
+}
+
+fn assert_teardown_invariants(scenario_name: &str) {
+    let Some(recorder) = stress_recorder::recorder() else {
+        tracing::warn!(
+            scenario = scenario_name,
+            "stress: no recorder installed, skipping teardown invariants"
+        );
+        return;
+    };
+    let per_area = read_mem_bytes_reserved(recorder);
+    let total: f64 = per_area.iter().map(|(_, v)| *v).sum();
+    tracing::info!(
+        scenario = scenario_name,
+        total_reserved_bytes = total,
+        ?per_area,
+        "stress: teardown mem.bytes_reserved"
+    );
+    assert!(
+        total <= TEARDOWN_RESERVED_SLACK_BYTES,
+        "teardown invariant violated: sum(mem.bytes_reserved) = {} bytes exceeds slack {} bytes (per-area: {:?})",
+        total,
+        TEARDOWN_RESERVED_SLACK_BYTES,
+        per_area,
+    );
+}
+
+/// Return `(area_label, gauge_value)` pairs for each `mem.bytes_reserved{area=...}` we know about.
+fn read_mem_bytes_reserved(recorder: &TestRecorder) -> Vec<(&'static str, f64)> {
+    ["upload", "prefetch"]
+        .into_iter()
+        .filter_map(|area| {
+            recorder
+                .get("mem.bytes_reserved", &[("area", area)])
+                .map(|metric| (area, metric.gauge()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -262,3 +362,4 @@ mod tests {
         assert_eq!(stalled.load(Ordering::SeqCst), 1, "worker 1 should have been flagged");
     }
 }
+

@@ -157,3 +157,30 @@ fn init_crt() {
     mountpoint_s3_client::config::io_library_init(&mountpoint_s3_client::config::Allocator::default());
     mountpoint_s3_client::config::s3_library_init(&mountpoint_s3_client::config::Allocator::default());
 }
+
+#[cfg(feature = "stress_tests")]
+pub mod stress_recorder {
+    use super::test_recorder::TestRecorder;
+    use std::sync::OnceLock;
+
+    static RECORDER: OnceLock<TestRecorder> = OnceLock::new();
+
+    pub fn install() {
+        RECORDER.get_or_init(|| {
+            let recorder = TestRecorder::default();
+            // Ignore errors: another test binary or ctor may have installed a recorder already.
+            let _ = metrics::set_global_recorder(recorder.clone());
+            recorder
+        });
+    }
+
+    pub fn recorder() -> Option<&'static TestRecorder> {
+        RECORDER.get()
+    }
+}
+
+#[cfg(feature = "stress_tests")]
+#[ctor::ctor]
+fn init_stress_recorder() {
+    stress_recorder::install();
+}
