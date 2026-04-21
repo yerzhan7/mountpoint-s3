@@ -35,7 +35,11 @@ impl Scenario for SustainedReads {
     fn setup(&self, session: &TestSession) {
         // Cheap deterministic payload — we don't verify content.
         let payload = vec![0xA5u8; FIXTURE_SIZE];
-        tracing::info!(size = FIXTURE_SIZE, key = FIXTURE_KEY, "sustained_reads: uploading fixture");
+        tracing::info!(
+            size = FIXTURE_SIZE,
+            key = FIXTURE_KEY,
+            "sustained_reads: uploading fixture"
+        );
         session.client().put_object(FIXTURE_KEY, &payload).unwrap();
     }
 

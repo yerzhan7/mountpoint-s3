@@ -180,8 +180,11 @@ fn spawn_watchdog(
                     last_progress[id] = current;
                     last_advance[id] = now;
                 } else if now.duration_since(last_advance[id]) >= max_idle {
-                    let snapshot: Vec<(usize, u64)> =
-                        progress.iter().enumerate().map(|(i, p)| (i, p.load(Ordering::Relaxed))).collect();
+                    let snapshot: Vec<(usize, u64)> = progress
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| (i, p.load(Ordering::Relaxed)))
+                        .collect();
                     tracing::error!(
                         scenario = %scenario_name,
                         stalled_worker = id,
@@ -214,11 +217,7 @@ fn read_metrics_interval_env() -> Duration {
     Duration::from_secs(secs)
 }
 
-fn spawn_metrics_logger(
-    scenario_name: String,
-    interval: Duration,
-    stop: Arc<AtomicBool>,
-) -> thread::JoinHandle<()> {
+fn spawn_metrics_logger(scenario_name: String, interval: Duration, stop: Arc<AtomicBool>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {
             // Sleep in small slices so we notice stop promptly.
@@ -362,4 +361,3 @@ mod tests {
         assert_eq!(stalled.load(Ordering::SeqCst), 1, "worker 1 should have been flagged");
     }
 }
-
