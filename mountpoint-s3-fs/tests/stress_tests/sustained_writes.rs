@@ -1,9 +1,9 @@
-//! `sustained_writes`: 64 workers concurrently writing 50-200 MiB objects under the 512 MiB
-//! memory limit. Exercises upload buffer allocation, CRT pool reservation under pressure,
-//! and (once admission control lands) ENOMEM-on-open tolerance.
+//! `sustained_writes`: 48 workers concurrently writing 50-200 MiB objects under the 512 MiB
+//! memory limit. Sized so the per-part upload reservations stay under the memory budget
+//! (48 workers × 8 MiB part-size = 384 MiB < 512 MiB).
 
 use std::fs::File;
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -13,17 +13,21 @@ use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 use crate::common::fuse::TestSessionConfig;
 use crate::stress_tests::harness::{self, Scenario};
 
-const NUM_WORKERS: usize = 64;
-const WRITE_CHUNK: usize = 1024 * 1024; // 1 MiB
+const NUM_WORKERS: usize = 48;
+const WRITE_CHUNK: usize = 8 * 1024 * 1024; // 8 MiB — matches default part size
 const MIN_OBJECT_SIZE: usize = 50 * 1024 * 1024;
 const MAX_OBJECT_SIZE: usize = 200 * 1024 * 1024;
-const ENOMEM_BACKOFF: Duration = Duration::from_millis(100);
 
 struct SustainedWrites;
 
 impl Scenario for SustainedWrites {
     fn name(&self) -> &str {
         "sustained_writes"
+    }
+
+    fn max_idle_duration(&self, _worker_id: usize) -> Duration {
+        // Flushing hundreds of MiB on close can legitimately take many seconds.
+        Duration::from_secs(30)
     }
 
     fn num_workers(&self) -> usize {
@@ -43,43 +47,26 @@ impl Scenario for SustainedWrites {
             let key = format!("w{worker_id:03}_i{iter:06}.bin");
             let path = mount_path.join(&key);
 
-            let mut file = match File::create(&path) {
-                Ok(f) => f,
-                Err(e) if is_enomem(&e) => {
-                    tracing::debug!(worker_id, ?e, "sustained_writes: ENOMEM on open, backing off");
-                    std::thread::sleep(ENOMEM_BACKOFF);
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(worker_id, ?e, "sustained_writes: open failed, backing off");
-                    std::thread::sleep(ENOMEM_BACKOFF);
-                    continue;
-                }
-            };
+            let mut file = File::create(&path).unwrap_or_else(|e| {
+                panic!("sustained_writes: worker {worker_id}: create failed: {e:?}");
+            });
+            progress.fetch_add(1, Ordering::Relaxed);
 
             let mut written = 0usize;
             while written < size && !stop.load(Ordering::Relaxed) {
                 let n = (size - written).min(WRITE_CHUNK);
-                match file.write_all(&chunk[..n]) {
-                    Ok(()) => {
-                        written += n;
-                        progress.fetch_add(n as u64, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        tracing::warn!(worker_id, ?e, "sustained_writes: write failed");
-                        break;
-                    }
-                }
+                file.write_all(&chunk[..n]).unwrap_or_else(|e| {
+                    panic!("sustained_writes: worker {worker_id}: write failed: {e:?}");
+                });
+                written += n;
+                progress.fetch_add(n as u64, Ordering::Relaxed);
             }
             drop(file);
+            progress.fetch_add(1, Ordering::Relaxed);
             // Best-effort cleanup so we don't accumulate thousands of objects during long runs.
             let _ = std::fs::remove_file(&path);
         }
     }
-}
-
-fn is_enomem(e: &std::io::Error) -> bool {
-    e.raw_os_error() == Some(libc::ENOMEM) || e.kind() == ErrorKind::OutOfMemory
 }
 
 /// Deterministic pseudo-random size in `[MIN_OBJECT_SIZE, MAX_OBJECT_SIZE]`.

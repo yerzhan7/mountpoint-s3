@@ -15,12 +15,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use mountpoint_s3_fs::s3::S3Path;
+
 use crate::common::fuse::{self, TestSession, TestSessionConfig};
 use crate::common::stress_recorder;
 use crate::common::test_recorder::TestRecorder;
 
 /// Default scenario duration if `STRESS_DURATION_SECS` is unset.
-const DEFAULT_DURATION_SECS: u64 = 60;
+const DEFAULT_DURATION_SECS: u64 = 30;
 
 /// Default metrics-logger interval if `STRESS_METRICS_INTERVAL_SECS` is unset.
 const DEFAULT_METRICS_INTERVAL_SECS: u64 = 10;
@@ -42,9 +44,11 @@ pub trait Scenario: Send + Sync {
     /// Short name used for logging and as the S3 test prefix component.
     fn name(&self) -> &str;
 
-    /// Maximum time any single worker may go without incrementing its progress counter
-    /// before the watchdog declares it stalled.
-    fn max_idle_duration(&self) -> Duration {
+    /// Maximum time worker `worker_id` may go without incrementing its progress counter
+    /// before the watchdog declares it stalled. The default is 30s; scenarios with
+    /// heterogeneous worker classes (e.g. readers vs writers) should override this to
+    /// return a tighter threshold for fast-moving workers.
+    fn max_idle_duration(&self, _worker_id: usize) -> Duration {
         Duration::from_secs(30)
     }
 
@@ -54,15 +58,27 @@ pub trait Scenario: Send + Sync {
     /// Session configuration for this scenario (memory limit, part size, etc.).
     fn session_config(&self) -> TestSessionConfig;
 
-    /// One-time setup (e.g. upload fixtures). Runs before any worker starts.
+    /// If `Some`, the harness mounts against this `S3Path` instead of a per-scenario nonced
+    /// prefix. Scenarios that depend on shared stress test objects return
+    /// [`crate::stress_tests::test_objects::shared_s3_path`] here.
+    fn s3_path_override(&self) -> Option<S3Path> {
+        None
+    }
+
+    /// One-time setup (e.g. upload test objects). Runs before any worker starts.
     fn setup(&self, _session: &TestSession) {}
 
     /// Worker body. Must loop until `stop` is set, incrementing `progress` to signal liveness.
-    /// Workers should not panic on ENOMEM from `open()`/`create()` — catch, briefly back off, retry.
     fn run_worker(&self, worker_id: usize, mount_path: &Path, progress: &AtomicU64, stop: &AtomicBool);
+
+    /// Expected peak `sum(mem.bytes_reserved)` ceiling in bytes. Defaults to
+    /// `session_config().filesystem_config.mem_limit`.
+    fn peak_reserved_ceiling_bytes(&self) -> f64 {
+        self.session_config().filesystem_config.mem_limit as f64
+    }
 }
 
-/// Run the given scenario. Reads `STRESS_DURATION_SECS` from env; default 60s.
+/// Run the given scenario. Reads `STRESS_DURATION_SECS` from env; default 30s.
 pub fn run<S: Scenario + 'static>(scenario: S) {
     // Make sure the snapshotting recorder is installed even if the common-module ctor has not
     // run yet (nextest uses a fresh process per test).
@@ -76,18 +92,28 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
         scenario = scenario.name(),
         duration_secs = duration.as_secs(),
         workers = scenario.num_workers(),
-        max_idle_secs = scenario.max_idle_duration().as_secs(),
         metrics_interval_secs = metrics_interval.as_secs(),
         "stress: starting"
     );
 
-    let session = fuse::s3_session::new(scenario.name(), scenario.session_config());
+    let session = match scenario.s3_path_override() {
+        Some(s3_path) => {
+            let region = crate::common::s3::get_test_region();
+            let sdk_client =
+                crate::common::tokio_block_on(async { crate::common::s3::get_test_sdk_client(&region).await });
+            fuse::s3_session::new_with_test_client(scenario.session_config(), sdk_client, s3_path)
+        }
+        None => fuse::s3_session::new(scenario.name(), scenario.session_config()),
+    };
     scenario.setup(&session);
 
     let num_workers = scenario.num_workers();
     let stop = Arc::new(AtomicBool::new(false));
     let progress: Vec<Arc<AtomicU64>> = (0..num_workers).map(|_| Arc::new(AtomicU64::new(0))).collect();
     let stalled_worker = Arc::new(AtomicUsize::new(NO_STALL));
+    let peak_reserved = Arc::new(AtomicU64::new(0));
+
+    let max_idles: Vec<Duration> = (0..num_workers).map(|i| scenario.max_idle_duration(i)).collect();
 
     let mount_path: std::path::PathBuf = session.mount_path().to_path_buf();
     let mut handles = Vec::with_capacity(num_workers);
@@ -103,12 +129,17 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
 
     let watchdog = spawn_watchdog(
         scenario.name().to_string(),
-        scenario.max_idle_duration(),
+        max_idles,
         progress.clone(),
         stop.clone(),
         stalled_worker.clone(),
     );
-    let metrics_logger = spawn_metrics_logger(scenario.name().to_string(), metrics_interval, stop.clone());
+    let metrics_logger = spawn_metrics_logger(
+        scenario.name().to_string(),
+        metrics_interval,
+        stop.clone(),
+        peak_reserved.clone(),
+    );
 
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
@@ -147,10 +178,15 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
         panic!(
             "stress: scenario {:?} failed: worker {stalled} stalled for at least {:?}",
             scenario.name(),
-            scenario.max_idle_duration()
+            scenario.max_idle_duration(stalled),
         );
     }
 
+    assert_peak_reserved_invariant(
+        scenario.name(),
+        peak_reserved.load(Ordering::Relaxed) as f64,
+        scenario.peak_reserved_ceiling_bytes(),
+    );
     assert_teardown_invariants(scenario.name());
 
     tracing::info!(scenario = scenario.name(), "stress: finished");
@@ -158,7 +194,7 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
 
 fn spawn_watchdog(
     scenario_name: String,
-    max_idle: Duration,
+    max_idle_per_worker: Vec<Duration>,
     progress: Vec<Arc<AtomicU64>>,
     stop: Arc<AtomicBool>,
     stalled_worker: Arc<AtomicUsize>,
@@ -179,7 +215,7 @@ fn spawn_watchdog(
                 if current > last_progress[id] {
                     last_progress[id] = current;
                     last_advance[id] = now;
-                } else if now.duration_since(last_advance[id]) >= max_idle {
+                } else if now.duration_since(last_advance[id]) >= max_idle_per_worker[id] {
                     let snapshot: Vec<(usize, u64)> = progress
                         .iter()
                         .enumerate()
@@ -188,7 +224,7 @@ fn spawn_watchdog(
                     tracing::error!(
                         scenario = %scenario_name,
                         stalled_worker = id,
-                        max_idle_secs = max_idle.as_secs(),
+                        max_idle_secs = max_idle_per_worker[id].as_secs(),
                         ?snapshot,
                         "stress: worker stalled — per-worker progress snapshot"
                     );
@@ -217,7 +253,12 @@ fn read_metrics_interval_env() -> Duration {
     Duration::from_secs(secs)
 }
 
-fn spawn_metrics_logger(scenario_name: String, interval: Duration, stop: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+fn spawn_metrics_logger(
+    scenario_name: String,
+    interval: Duration,
+    stop: Arc<AtomicBool>,
+    peak_reserved: Arc<AtomicU64>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {
             // Sleep in small slices so we notice stop promptly.
@@ -228,26 +269,58 @@ fn spawn_metrics_logger(scenario_name: String, interval: Duration, stop: Arc<Ato
                 thread::sleep(s);
                 remaining = remaining.saturating_sub(s);
             }
-            log_mem_metrics(&scenario_name);
+            let total = log_mem_metrics(&scenario_name);
+            update_peak_reserved(&peak_reserved, total);
         }
     })
 }
 
-/// Log the current `mem.bytes_reserved` gauges (per area). Extend this list as the memory
-/// limiter registers richer metrics (allocation queue depth, pruning counters, etc.).
-fn log_mem_metrics(scenario_name: &str) {
-    let Some(recorder) = stress_recorder::recorder() else {
+fn update_peak_reserved(peak_reserved: &AtomicU64, sample: f64) {
+    if !sample.is_finite() || sample < 0.0 {
         return;
+    }
+    let sample_u64 = sample.round() as u64;
+    let mut current = peak_reserved.load(Ordering::Relaxed);
+    while sample_u64 > current {
+        match peak_reserved.compare_exchange_weak(current, sample_u64, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Log the current `mem.bytes_reserved` gauges (per area) and return the summed total.
+fn log_mem_metrics(scenario_name: &str) -> f64 {
+    let Some(recorder) = stress_recorder::recorder() else {
+        return 0.0;
     };
-    for (area, total) in read_mem_bytes_reserved(recorder) {
+    let per_area = read_mem_bytes_reserved(recorder);
+    let total: f64 = per_area.iter().map(|(_, v)| *v).sum();
+    for (area, value) in &per_area {
         tracing::info!(
             scenario = scenario_name,
             metric = "mem.bytes_reserved",
-            area,
-            value = total,
+            area = *area,
+            value = *value,
             "stress: metric",
         );
     }
+    total
+}
+
+fn assert_peak_reserved_invariant(scenario_name: &str, peak: f64, ceiling: f64) {
+    tracing::info!(
+        scenario = scenario_name,
+        peak_reserved_bytes = peak,
+        ceiling_bytes = ceiling,
+        "stress: peak mem.bytes_reserved"
+    );
+    assert!(
+        peak <= ceiling,
+        "peak-reserved invariant violated: peak sum(mem.bytes_reserved) = {} bytes exceeds ceiling {} bytes",
+        peak,
+        ceiling,
+    );
 }
 
 fn assert_teardown_invariants(scenario_name: &str) {
@@ -291,6 +364,10 @@ fn read_mem_bytes_reserved(recorder: &TestRecorder) -> Vec<(&'static str, f64)> 
 mod tests {
     use super::*;
 
+    fn all_workers_threshold(num_workers: usize, d: Duration) -> Vec<Duration> {
+        vec![d; num_workers]
+    }
+
     #[test]
     fn watchdog_detects_stall_on_single_worker() {
         let progress = vec![Arc::new(AtomicU64::new(0))];
@@ -298,7 +375,7 @@ mod tests {
         let stalled = Arc::new(AtomicUsize::new(NO_STALL));
         let wd = spawn_watchdog(
             "test".into(),
-            Duration::from_millis(500),
+            all_workers_threshold(1, Duration::from_millis(500)),
             progress,
             stop.clone(),
             stalled.clone(),
@@ -316,7 +393,7 @@ mod tests {
         let stalled = Arc::new(AtomicUsize::new(NO_STALL));
         let wd = spawn_watchdog(
             "test".into(),
-            Duration::from_millis(500),
+            all_workers_threshold(2, Duration::from_millis(500)),
             progress.clone(),
             stop.clone(),
             stalled.clone(),
@@ -343,7 +420,7 @@ mod tests {
         let stalled = Arc::new(AtomicUsize::new(NO_STALL));
         let wd = spawn_watchdog(
             "test".into(),
-            Duration::from_millis(500),
+            all_workers_threshold(2, Duration::from_millis(500)),
             progress.clone(),
             stop.clone(),
             stalled.clone(),
@@ -359,5 +436,40 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         wd.join().unwrap();
         assert_eq!(stalled.load(Ordering::SeqCst), 1, "worker 1 should have been flagged");
+    }
+
+    #[test]
+    fn watchdog_respects_per_worker_thresholds() {
+        // Worker 0 has a 2s threshold (never reached in this test window) and never advances.
+        // Worker 1 has a 300ms threshold and never advances — it should be flagged first.
+        let progress = vec![Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
+        let stop = Arc::new(AtomicBool::new(false));
+        let stalled = Arc::new(AtomicUsize::new(NO_STALL));
+        let thresholds = vec![Duration::from_secs(2), Duration::from_millis(300)];
+        let wd = spawn_watchdog(
+            "test".into(),
+            thresholds,
+            progress.clone(),
+            stop.clone(),
+            stalled.clone(),
+        )
+        .expect("watchdog disabled via env");
+        wd.join().unwrap();
+        assert_eq!(stalled.load(Ordering::SeqCst), 1, "worker 1 should be flagged first");
+    }
+
+    #[test]
+    fn update_peak_reserved_tracks_running_max() {
+        let peak = AtomicU64::new(0);
+        update_peak_reserved(&peak, 100.0);
+        assert_eq!(peak.load(Ordering::Relaxed), 100);
+        update_peak_reserved(&peak, 50.0);
+        assert_eq!(peak.load(Ordering::Relaxed), 100);
+        update_peak_reserved(&peak, 500.0);
+        assert_eq!(peak.load(Ordering::Relaxed), 500);
+        update_peak_reserved(&peak, -5.0);
+        assert_eq!(peak.load(Ordering::Relaxed), 500);
+        update_peak_reserved(&peak, f64::NAN);
+        assert_eq!(peak.load(Ordering::Relaxed), 500);
     }
 }

@@ -22,7 +22,7 @@ impl Scenario for SmokeScenario {
         "stress_smoke"
     }
 
-    fn max_idle_duration(&self) -> Duration {
+    fn max_idle_duration(&self, _worker_id: usize) -> Duration {
         Duration::from_secs(10)
     }
 

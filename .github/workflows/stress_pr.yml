@@ -1,0 +1,20 @@
+name: Stress Tests (PR)
+
+# Runs the reusable stress workflow when a pull request is labelled `stress`.
+# Approval gate is enforced via the `PR stress` environment in `stress.yml`.
+on:
+  pull_request_target:
+    types: [labeled, opened, reopened, synchronize]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  stress:
+    name: Stress Tests
+    uses: ./.github/workflows/stress.yml
+    if: ${{ contains(github.event.pull_request.labels.*.name, 'stress') }}
+    with:
+      environment: PR stress
+      ref: ${{ github.event.pull_request.head.sha }}

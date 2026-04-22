@@ -1,7 +1,8 @@
 //! `churn`: short-lived handles + idle-held handles under the 512 MiB memory limit. 48 workers
-//! open a random fixture, read it fully, close; repeated. 8 additional workers open a handle
-//! and stay idle for 5-15s before closing and re-opening. Targets lifecycle-related races and
-//! creates natural pruning candidates.
+//! open a random shared test object, read it fully, close; repeated. 8 additional workers open
+//! a handle, read 1 MiB (to trigger a prefetcher reservation), then stay idle for 5-15s before
+//! closing and re-opening. Targets lifecycle-related races and creates natural pruning
+//! candidates for the upcoming strategy-D pruner.
 
 use std::fs::File;
 use std::io::Read;
@@ -10,21 +11,30 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
+use mountpoint_s3_fs::s3::S3Path;
 
 use crate::common::fuse::{TestSession, TestSessionConfig};
 use crate::stress_tests::harness::{self, Scenario};
+use crate::stress_tests::test_objects::{self, SMALL_SET_COUNT, SMALL_SET_SIZE, small_object_key};
 
 const NUM_SHORT_WORKERS: usize = 48;
 const NUM_IDLE_WORKERS: usize = 8;
-const NUM_FIXTURES: usize = 100;
-const FIXTURE_SIZE: usize = 128 * 1024; // 128 KiB
-const BACKOFF: Duration = Duration::from_millis(100);
+const IDLE_READ_BYTES: usize = 1024 * 1024; // 1 MiB
 
 struct Churn;
 
 impl Scenario for Churn {
     fn name(&self) -> &str {
         "churn"
+    }
+
+    fn max_idle_duration(&self, worker_id: usize) -> Duration {
+        if worker_id < NUM_SHORT_WORKERS {
+            Duration::from_secs(5)
+        } else {
+            // Idle workers hold a handle open for up to 15s per cycle; give some slack.
+            Duration::from_secs(30)
+        }
     }
 
     fn num_workers(&self) -> usize {
@@ -35,12 +45,12 @@ impl Scenario for Churn {
         TestSessionConfig::default().with_mem_limit(MINIMUM_MEM_LIMIT)
     }
 
-    fn setup(&self, session: &TestSession) {
-        tracing::info!(count = NUM_FIXTURES, size = FIXTURE_SIZE, "churn: uploading fixtures");
-        let payload = vec![0x5Au8; FIXTURE_SIZE];
-        for i in 0..NUM_FIXTURES {
-            session.client().put_object(&fixture_key(i), &payload).unwrap();
-        }
+    fn s3_path_override(&self) -> Option<S3Path> {
+        Some(test_objects::shared_s3_path())
+    }
+
+    fn setup(&self, _session: &TestSession) {
+        test_objects::ensure_small_set();
     }
 
     fn run_worker(&self, worker_id: usize, mount_path: &Path, progress: &AtomicU64, stop: &AtomicBool) {
@@ -52,28 +62,20 @@ impl Scenario for Churn {
     }
 }
 
-fn fixture_key(i: usize) -> String {
-    format!("churn/fixture_{i:04}.bin")
-}
-
 fn short_loop(worker_id: usize, mount_path: &Path, progress: &AtomicU64, stop: &AtomicBool) {
-    let mut buf = vec![0u8; FIXTURE_SIZE];
+    let mut buf = vec![0u8; SMALL_SET_SIZE];
     let mut iter: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         iter += 1;
-        // Deterministic pseudo-random pick across fixtures.
-        let idx = (iter.wrapping_mul(2_654_435_761).wrapping_add(worker_id as u64) as usize) % NUM_FIXTURES;
-        let path = mount_path.join(fixture_key(idx));
-        let mut file = match File::open(&path) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(worker_id, ?e, "churn: open failed");
-                std::thread::sleep(BACKOFF);
-                continue;
-            }
-        };
+        // Deterministic pseudo-random pick across the shared small-object set.
+        let idx = (iter.wrapping_mul(2_654_435_761).wrapping_add(worker_id as u64) as usize) % SMALL_SET_COUNT;
+        let path = mount_path.join(small_object_key(idx));
+        let mut file = File::open(&path).unwrap_or_else(|e| {
+            panic!("churn: worker {worker_id}: open of {path:?} failed: {e:?}");
+        });
+        progress.fetch_add(1, Ordering::Relaxed);
         let mut read = 0usize;
-        while read < FIXTURE_SIZE && !stop.load(Ordering::Relaxed) {
+        while read < SMALL_SET_SIZE && !stop.load(Ordering::Relaxed) {
             match file.read(&mut buf[read..]) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -81,34 +83,50 @@ fn short_loop(worker_id: usize, mount_path: &Path, progress: &AtomicU64, stop: &
                     progress.fetch_add(n as u64, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    tracing::warn!(worker_id, ?e, "churn: read failed");
-                    break;
+                    panic!("churn: worker {worker_id}: read of {path:?} failed: {e:?}");
                 }
             }
         }
     }
 }
 
-/// Open a handle, hold it idle for 5-15s, close, re-open. Progress is incremented once per
-/// open/close cycle so the watchdog sees forward progress even though we're not reading.
+/// Open a handle, read 1 MiB to trigger a prefetcher reservation, hold the handle idle for
+/// 5-15s, then close and re-open. Progress is incremented on every open, every byte read, and
+/// every close, so the watchdog sees forward progress even though we're mostly idle.
 fn idle_loop(worker_id: usize, mount_path: &Path, progress: &AtomicU64, stop: &AtomicBool) {
+    let mut buf = vec![0u8; IDLE_READ_BYTES];
     let mut iter: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         iter += 1;
-        let idx = (iter.wrapping_mul(2_246_822_519).wrapping_add(worker_id as u64) as usize) % NUM_FIXTURES;
-        let path = mount_path.join(fixture_key(idx));
-        let Ok(_file) = File::open(&path) else {
-            std::thread::sleep(BACKOFF);
-            continue;
-        };
+        let idx = (iter.wrapping_mul(2_246_822_519).wrapping_add(worker_id as u64) as usize) % SMALL_SET_COUNT;
+        let path = mount_path.join(small_object_key(idx));
+        let mut file = File::open(&path).unwrap_or_else(|e| {
+            panic!("churn: idle worker {worker_id}: open of {path:?} failed: {e:?}");
+        });
+        progress.fetch_add(1, Ordering::Relaxed);
+
+        // Drive at least one read so the prefetcher reserves memory against this handle; the
+        // handle then becomes a valid pruning candidate while it sits idle below.
+        let mut read = 0usize;
+        while read < IDLE_READ_BYTES.min(SMALL_SET_SIZE) && !stop.load(Ordering::Relaxed) {
+            match file.read(&mut buf[read..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    read += n;
+                    progress.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    panic!("churn: idle worker {worker_id}: read of {path:?} failed: {e:?}");
+                }
+            }
+        }
 
         let idle_secs = 5 + (iter % 11); // 5..=15
         let idle_deadline = Instant::now() + Duration::from_secs(idle_secs);
         while Instant::now() < idle_deadline && !stop.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(500));
         }
-        // Increment progress on close so the watchdog doesn't treat a 15s hold as a stall.
-        // (scenario.max_idle_duration() defaults to 30s which covers the 15s upper bound.)
+        drop(file);
         progress.fetch_add(1, Ordering::Relaxed);
     }
 }
