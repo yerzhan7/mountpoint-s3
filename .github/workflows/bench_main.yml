@@ -1,10 +1,9 @@
 name: Benchmarks
 
+# Temporarily disabled on this fork while stress tests are being developed.
+# Only manual dispatch is enabled.
 on:
-  push:
-    branches: [ "main", "wf-changes/**" ]
-  schedule:
-    - cron: "0 2 * * *" # Daily at 02:00 UTC
+  workflow_dispatch:
 
 permissions:
   id-token: write

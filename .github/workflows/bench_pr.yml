@@ -1,8 +1,8 @@
 name: Benchmarks (PR)
 
+# Temporarily disabled on this fork while stress tests are being developed.
 on:
-  pull_request_target:
-    types: [ labeled, opened, reopened, synchronize ]
+  workflow_dispatch:
 
 permissions:
   id-token: write

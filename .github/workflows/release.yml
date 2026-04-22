@@ -1,9 +1,8 @@
 name: Release
 
+# Temporarily disabled on this fork while stress tests are being developed.
 on:
-  push:
-    tags:
-      - mountpoint-s3-[0-9]+.*
+  workflow_dispatch:
 
 permissions:
   contents: write

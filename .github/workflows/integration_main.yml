@@ -1,12 +1,8 @@
 name: Integration tests
 
+# Temporarily disabled on this fork while stress tests are being developed.
+# Only manual dispatch is enabled.
 on:
-  push:
-    branches: [ "main", "wf-changes/**" ]
-  merge_group:
-    types: [ "checks_requested" ]
-  schedule:
-    - cron: "45 6 * * *" # Daily at 06:45 UTC
   workflow_dispatch:
     inputs:
       ref:
