@@ -412,15 +412,27 @@ fn assert_peak_reserved_invariant(scenario_name: &str, ceiling: f64) {
     let additional_mem_reserved = (mem_limit / 8).max(128 * 1024 * 1024);
     let effective_budget = mem_limit.saturating_sub(additional_mem_reserved);
     let overshoot = peak_upper_bound.saturating_sub(effective_budget);
-    tracing::info!(
-        scenario = scenario_name,
-        peak_reserved_bytes = peak_upper_bound,
-        ceiling_bytes = ceiling,
-        effective_budget_bytes = effective_budget,
-        effective_budget_overshoot_bytes = overshoot,
-        ?per_area_peak,
-        "stress: peak mem.bytes_reserved"
-    );
+    if overshoot > 0 {
+        tracing::warn!(
+            scenario = scenario_name,
+            peak_reserved_bytes = peak_upper_bound,
+            ceiling_bytes = ceiling,
+            effective_budget_bytes = effective_budget,
+            effective_budget_overshoot_bytes = overshoot,
+            ?per_area_peak,
+            "stress: peak mem.bytes_reserved exceeds effective budget (mem_limit - additional_mem_reserved)"
+        );
+    } else {
+        tracing::info!(
+            scenario = scenario_name,
+            peak_reserved_bytes = peak_upper_bound,
+            ceiling_bytes = ceiling,
+            effective_budget_bytes = effective_budget,
+            effective_budget_overshoot_bytes = overshoot,
+            ?per_area_peak,
+            "stress: peak mem.bytes_reserved"
+        );
+    }
     assert!(
         (peak_upper_bound as f64) <= ceiling,
         "peak-reserved invariant violated: peak sum(mem.bytes_reserved) = {} bytes exceeds ceiling {} bytes (per-area peaks: {:?})",
