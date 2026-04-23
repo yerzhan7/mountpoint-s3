@@ -6,13 +6,12 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
 
 use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 use mountpoint_s3_fs::s3::S3Path;
 
 use crate::common::fuse::{TestSession, TestSessionConfig};
-use crate::stress_tests::harness::{self, Scenario};
+use crate::stress_tests::harness::{self, Op, Scenario, WorkerRecorder};
 use crate::stress_tests::test_objects::{self, READ_OBJECT_KEY};
 
 const READ_CHUNK: usize = 8 * 1024 * 1024; // 8 MiB — matches default part size
@@ -23,11 +22,6 @@ struct SustainedReads;
 impl Scenario for SustainedReads {
     fn name(&self) -> &str {
         "sustained_reads"
-    }
-
-    fn max_idle_duration(&self, _worker_id: usize) -> Duration {
-        // Readers are fast-moving; 5s is plenty between successive progress bumps.
-        Duration::from_secs(5)
     }
 
     fn num_workers(&self) -> usize {
@@ -46,29 +40,39 @@ impl Scenario for SustainedReads {
         test_objects::ensure_read_object();
     }
 
-    fn run_worker(&self, _worker_id: usize, mount_path: &Path, progress: &AtomicU64, stop: &AtomicBool) {
+    fn run_worker(
+        &self,
+        _worker_id: usize,
+        mount_path: &Path,
+        progress: &AtomicU64,
+        recorder: &mut WorkerRecorder,
+        stop: &AtomicBool,
+    ) {
         let path = mount_path.join(READ_OBJECT_KEY);
         let mut buf = vec![0u8; READ_CHUNK];
         while !stop.load(Ordering::Relaxed) {
-            let mut file = File::open(&path).unwrap_or_else(|e| {
-                panic!("sustained_reads: open of {path:?} failed: {e:?}");
-            });
+            let mut file = recorder
+                .time(Op::Open, || File::open(&path))
+                .unwrap_or_else(|e| {
+                    panic!("sustained_reads: open of {path:?} failed: {e:?}");
+                });
             // Count every successful open as progress too.
             progress.fetch_add(1, Ordering::Relaxed);
             loop {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
-                match file.read(&mut buf) {
-                    Ok(0) => break, // EOF — re-open
-                    Ok(n) => {
-                        progress.fetch_add(n as u64, Ordering::Relaxed);
-                    }
-                    Err(e) => {
+                let n = recorder
+                    .time(Op::Read, || file.read(&mut buf))
+                    .unwrap_or_else(|e| {
                         panic!("sustained_reads: read of {path:?} failed: {e:?}");
-                    }
+                    });
+                if n == 0 {
+                    break; // EOF — re-open
                 }
+                progress.fetch_add(n as u64, Ordering::Relaxed);
             }
+            recorder.time(Op::Close, || drop(file));
         }
     }
 }

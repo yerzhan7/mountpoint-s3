@@ -5,12 +5,11 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
 
 use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 
 use crate::common::fuse::TestSessionConfig;
-use crate::stress_tests::harness::{self, Scenario};
+use crate::stress_tests::harness::{self, Op, Scenario, WorkerRecorder};
 
 const KEY: &str = "smoke.bin";
 const PAYLOAD_LEN: usize = 4096;
@@ -20,10 +19,6 @@ struct SmokeScenario;
 impl Scenario for SmokeScenario {
     fn name(&self) -> &str {
         "stress_smoke"
-    }
-
-    fn max_idle_duration(&self, _worker_id: usize) -> Duration {
-        Duration::from_secs(10)
     }
 
     fn num_workers(&self) -> usize {
@@ -39,12 +34,20 @@ impl Scenario for SmokeScenario {
         session.client().put_object(KEY, &payload).unwrap();
     }
 
-    fn run_worker(&self, _worker_id: usize, mount_path: &Path, progress: &AtomicU64, stop: &AtomicBool) {
+    fn run_worker(
+        &self,
+        _worker_id: usize,
+        mount_path: &Path,
+        progress: &AtomicU64,
+        recorder: &mut WorkerRecorder,
+        stop: &AtomicBool,
+    ) {
         let path = mount_path.join(KEY);
         while !stop.load(Ordering::Relaxed) {
             let mut buf = Vec::with_capacity(PAYLOAD_LEN);
-            let mut f = File::open(&path).unwrap();
-            let n = f.read_to_end(&mut buf).unwrap();
+            let mut f = recorder.time(Op::Open, || File::open(&path)).unwrap();
+            let n = recorder.time(Op::Read, || f.read_to_end(&mut buf)).unwrap();
+            recorder.time(Op::Close, || drop(f));
             progress.fetch_add(n as u64, Ordering::Relaxed);
         }
     }
