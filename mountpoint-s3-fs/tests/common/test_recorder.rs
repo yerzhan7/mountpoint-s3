@@ -221,11 +221,30 @@ pub mod stress {
         }
     }
 
+    /// State behind a [`StressMetric::Gauge`]. Holds both the latest point-in-time value and
+    /// a history of every value the gauge has taken on since installation. The history lets
+    /// tests assert true peak/percentiles of the gauge without sampling races; the current
+    /// value is still needed for teardown invariants ("did everything get released?").
+    #[derive(Debug)]
+    pub struct GaugeState {
+        pub current: f64,
+        pub history: HdrHistogram<u64>,
+    }
+
+    impl Default for GaugeState {
+        fn default() -> Self {
+            Self {
+                current: 0.0,
+                history: new_hdr(),
+            }
+        }
+    }
+
     #[derive(Debug)]
     pub enum StressMetric {
         Histogram(Mutex<HdrHistogram<u64>>),
         Counter(Mutex<u64>),
-        Gauge(Mutex<f64>),
+        Gauge(Mutex<GaugeState>),
     }
 
     impl Default for StressMetric {
@@ -238,13 +257,23 @@ pub mod stress {
     pub enum StressMetricSnapshot {
         Histogram(HdrHistogram<u64>),
         Counter(u64),
-        Gauge(f64),
+        /// `(current_value, history_of_every_value_seen)`.
+        Gauge { current: f64, history: HdrHistogram<u64> },
     }
 
     impl StressMetric {
         pub fn gauge(&self) -> f64 {
             match self {
-                StressMetric::Gauge(g) => *g.lock().unwrap(),
+                StressMetric::Gauge(g) => g.lock().unwrap().current,
+                _ => panic!("expected gauge"),
+            }
+        }
+
+        /// Clone of the full history of values this gauge has been set to since installation.
+        /// Use `.max()` on the returned histogram to get the true peak without sampling races.
+        pub fn gauge_history(&self) -> HdrHistogram<u64> {
+            match self {
+                StressMetric::Gauge(g) => g.lock().unwrap().history.clone(),
                 _ => panic!("expected gauge"),
             }
         }
@@ -267,7 +296,13 @@ pub mod stress {
             match self {
                 StressMetric::Histogram(h) => StressMetricSnapshot::Histogram(h.lock().unwrap().clone()),
                 StressMetric::Counter(c) => StressMetricSnapshot::Counter(*c.lock().unwrap()),
-                StressMetric::Gauge(g) => StressMetricSnapshot::Gauge(*g.lock().unwrap()),
+                StressMetric::Gauge(g) => {
+                    let g = g.lock().unwrap();
+                    StressMetricSnapshot::Gauge {
+                        current: g.current,
+                        history: g.history.clone(),
+                    }
+                }
             }
         }
     }
@@ -289,7 +324,7 @@ pub mod stress {
             let mut metrics = self.metrics.lock().unwrap();
             let metric = metrics
                 .entry(key.clone())
-                .or_insert_with(|| Arc::new(StressMetric::Gauge(Mutex::new(0.0))));
+                .or_insert_with(|| Arc::new(StressMetric::Gauge(Mutex::new(GaugeState::default()))));
             Gauge::from_arc(metric.clone())
         }
 
@@ -322,20 +357,46 @@ pub mod stress {
             let StressMetric::Gauge(g) = self else {
                 panic!("expected gauge");
             };
-            *g.lock().unwrap() += value;
+            let mut g = g.lock().unwrap();
+            g.current += value;
+            let current = g.current;
+            record_gauge_sample(&mut g.history, current);
         }
         fn decrement(&self, value: f64) {
             let StressMetric::Gauge(g) = self else {
                 panic!("expected gauge");
             };
-            *g.lock().unwrap() -= value;
+            let mut g = g.lock().unwrap();
+            g.current -= value;
+            let current = g.current;
+            record_gauge_sample(&mut g.history, current);
         }
         fn set(&self, value: f64) {
             let StressMetric::Gauge(g) = self else {
                 panic!("expected gauge");
             };
-            *g.lock().unwrap() = value;
+            let mut g = g.lock().unwrap();
+            g.current = value;
+            let current = g.current;
+            record_gauge_sample(&mut g.history, current);
         }
+    }
+
+    /// Record a gauge's post-mutation value into its history histogram.
+    ///
+    /// The history is an HDR histogram of `u64`, so we clamp to `[0, hist.high()]` and cast.
+    /// A gauge that goes negative is clamped to 0 in the history (uncommon for the metrics
+    /// stress tests observe, but noted).
+    fn record_gauge_sample(history: &mut HdrHistogram<u64>, value: f64) {
+        let high = history.high() as f64;
+        let clamped = if value.is_nan() || value < 0.0 {
+            0
+        } else if value > high {
+            history.high()
+        } else {
+            value as u64
+        };
+        history.record(clamped).ok();
     }
 
     impl HistogramFn for StressMetric {
@@ -407,6 +468,22 @@ pub mod stress {
             g.set(42.5);
             assert_eq!(rec.get("c", &[]).unwrap().counter(), 8);
             assert_eq!(rec.get("g", &[]).unwrap().gauge(), 42.5);
+        }
+
+        #[test]
+        fn gauge_history_tracks_peak_and_current() {
+            let rec = StressTestRecorder::default();
+            let g = rec.register_gauge(&Key::from_name("mem.bytes_reserved"), &meta());
+            // Simulate reserve-spike-release: peak at 1000, then back to 0.
+            g.increment(100.0);
+            g.increment(900.0); // peak of 1000
+            g.decrement(900.0);
+            g.decrement(100.0); // now 0
+            let got = rec.get("mem.bytes_reserved", &[]).unwrap();
+            assert_eq!(got.gauge(), 0.0, "current should be zero after full release");
+            let hist = got.gauge_history();
+            assert_eq!(hist.len(), 4, "four mutations recorded");
+            assert_eq!(hist.max(), 1000, "peak should reflect the spike, not the current value");
         }
     }
 }

@@ -200,7 +200,6 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
     let stop = Arc::new(AtomicBool::new(false));
     let progress: Vec<Arc<AtomicU64>> = (0..num_workers).map(|_| Arc::new(AtomicU64::new(0))).collect();
     let stalled_worker = Arc::new(AtomicUsize::new(NO_STALL));
-    let peak_reserved = Arc::new(AtomicU64::new(0));
 
     let max_idles: Vec<Duration> = (0..num_workers).map(|i| scenario.max_idle_duration(i)).collect();
 
@@ -225,12 +224,7 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
         stop.clone(),
         stalled_worker.clone(),
     );
-    let metrics_logger = spawn_metrics_logger(
-        scenario.name().to_string(),
-        metrics_interval,
-        stop.clone(),
-        peak_reserved.clone(),
-    );
+    let metrics_logger = spawn_metrics_logger(scenario.name().to_string(), metrics_interval, stop.clone());
 
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
@@ -279,11 +273,7 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
 
     dump_summary(scenario.name(), &aggregate);
 
-    assert_peak_reserved_invariant(
-        scenario.name(),
-        peak_reserved.load(Ordering::Relaxed) as f64,
-        scenario.peak_reserved_ceiling_bytes(),
-    );
+    assert_peak_reserved_invariant(scenario.name(), scenario.peak_reserved_ceiling_bytes());
     assert_teardown_invariants(scenario.name());
     assert_p100_latency(scenario.name(), &aggregate, scenario.max_latency());
 
@@ -351,12 +341,7 @@ fn read_metrics_interval_env() -> Duration {
     Duration::from_secs(secs)
 }
 
-fn spawn_metrics_logger(
-    scenario_name: String,
-    interval: Duration,
-    stop: Arc<AtomicBool>,
-    peak_reserved: Arc<AtomicU64>,
-) -> thread::JoinHandle<()> {
+fn spawn_metrics_logger(scenario_name: String, interval: Duration, stop: Arc<AtomicBool>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {
             // Sleep in small slices so we notice stop promptly.
@@ -367,33 +352,18 @@ fn spawn_metrics_logger(
                 thread::sleep(s);
                 remaining = remaining.saturating_sub(s);
             }
-            let total = log_mem_metrics(&scenario_name);
-            update_peak_reserved(&peak_reserved, total);
+            log_mem_metrics(&scenario_name);
         }
     })
 }
 
-fn update_peak_reserved(peak_reserved: &AtomicU64, sample: f64) {
-    if !sample.is_finite() || sample < 0.0 {
-        return;
-    }
-    let sample_u64 = sample.round() as u64;
-    let mut current = peak_reserved.load(Ordering::Relaxed);
-    while sample_u64 > current {
-        match peak_reserved.compare_exchange_weak(current, sample_u64, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
-        }
-    }
-}
-
-/// Log the current `mem.bytes_reserved` gauges (per area) and return the summed total.
-fn log_mem_metrics(scenario_name: &str) -> f64 {
+/// Log the current `mem.bytes_reserved` gauges (per area). Returns nothing — peak tracking
+/// is handled by the gauge's own history (see [`crate::common::test_recorder::stress`]).
+fn log_mem_metrics(scenario_name: &str) {
     let Some(recorder) = stress_recorder::recorder() else {
-        return 0.0;
+        return;
     };
     let per_area = read_mem_bytes_reserved(recorder);
-    let total: f64 = per_area.iter().map(|(_, v)| *v).sum();
     for (area, value) in &per_area {
         tracing::info!(
             scenario = scenario_name,
@@ -403,21 +373,44 @@ fn log_mem_metrics(scenario_name: &str) -> f64 {
             "stress: metric",
         );
     }
-    total
 }
 
-fn assert_peak_reserved_invariant(scenario_name: &str, peak: f64, ceiling: f64) {
+/// Assert the true peak of `sum(mem.bytes_reserved)` over the whole run stayed at or below
+/// `ceiling`. The peak comes from each gauge's post-mutation history, so no samples can be
+/// missed between allocation spikes.
+fn assert_peak_reserved_invariant(scenario_name: &str, ceiling: f64) {
+    let Some(recorder) = stress_recorder::recorder() else {
+        tracing::warn!(
+            scenario = scenario_name,
+            "stress: no recorder installed, skipping peak-reserved invariant"
+        );
+        return;
+    };
+    let per_area_peak: Vec<(&'static str, u64)> = ["upload", "prefetch"]
+        .into_iter()
+        .filter_map(|area| {
+            recorder
+                .get("mem.bytes_reserved", &[("area", area)])
+                .map(|metric| (area, metric.gauge_history().max()))
+        })
+        .collect();
+    // The real peak of `sum(gauges)` requires point-in-time correlation across areas, which
+    // we don't have — but summing per-area peaks gives an upper bound of the true peak sum,
+    // which is exactly what we want for an "at or below ceiling" invariant.
+    let peak_upper_bound: u64 = per_area_peak.iter().map(|(_, v)| *v).sum();
     tracing::info!(
         scenario = scenario_name,
-        peak_reserved_bytes = peak,
+        peak_reserved_bytes = peak_upper_bound,
         ceiling_bytes = ceiling,
+        ?per_area_peak,
         "stress: peak mem.bytes_reserved"
     );
     assert!(
-        peak <= ceiling,
-        "peak-reserved invariant violated: peak sum(mem.bytes_reserved) = {} bytes exceeds ceiling {} bytes",
-        peak,
+        (peak_upper_bound as f64) <= ceiling,
+        "peak-reserved invariant violated: peak sum(mem.bytes_reserved) = {} bytes exceeds ceiling {} bytes (per-area peaks: {:?})",
+        peak_upper_bound,
         ceiling,
+        per_area_peak,
     );
 }
 
@@ -512,7 +505,16 @@ fn dump_summary(scenario_name: &str, aggregate: &WorkerRecorder) {
                 }
             }
             StressMetricSnapshot::Counter(c) => tracing::info!("counter {key}: {c}"),
-            StressMetricSnapshot::Gauge(g) => tracing::info!("gauge {key}: {g}"),
+            StressMetricSnapshot::Gauge { current, history } => {
+                let peak = history.max();
+                tracing::info!(
+                    "gauge {key}: current={current} peak={peak} samples={} (p50={} p90={} p99={})",
+                    history.len(),
+                    history.value_at_quantile(0.50),
+                    history.value_at_quantile(0.90),
+                    history.value_at_quantile(0.99),
+                );
+            }
         }
     }
 }
@@ -672,20 +674,5 @@ mod tests {
         .expect("watchdog disabled via env");
         wd.join().unwrap();
         assert_eq!(stalled.load(Ordering::SeqCst), 1, "worker 1 should be flagged first");
-    }
-
-    #[test]
-    fn update_peak_reserved_tracks_running_max() {
-        let peak = AtomicU64::new(0);
-        update_peak_reserved(&peak, 100.0);
-        assert_eq!(peak.load(Ordering::Relaxed), 100);
-        update_peak_reserved(&peak, 50.0);
-        assert_eq!(peak.load(Ordering::Relaxed), 100);
-        update_peak_reserved(&peak, 500.0);
-        assert_eq!(peak.load(Ordering::Relaxed), 500);
-        update_peak_reserved(&peak, -5.0);
-        assert_eq!(peak.load(Ordering::Relaxed), 500);
-        update_peak_reserved(&peak, f64::NAN);
-        assert_eq!(peak.load(Ordering::Relaxed), 500);
     }
 }
