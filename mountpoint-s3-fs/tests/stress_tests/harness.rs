@@ -177,14 +177,21 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
         "stress: starting"
     );
 
-    let session = match scenario.s3_path_override() {
-        Some(s3_path) => {
-            let region = crate::common::s3::get_test_region();
-            let sdk_client =
-                crate::common::tokio_block_on(async { crate::common::s3::get_test_sdk_client(&region).await });
-            fuse::s3_session::new_with_test_client(scenario.session_config(), sdk_client, s3_path)
+    let session = {
+        let mut config = scenario.session_config();
+        // Enable delete + overwrite so scenarios can best-effort clean up their ephemeral
+        // objects through the mount without tripping mountpoint's default write-once semantics.
+        config.filesystem_config.allow_delete = true;
+        config.filesystem_config.allow_overwrite = true;
+        match scenario.s3_path_override() {
+            Some(s3_path) => {
+                let region = crate::common::s3::get_test_region();
+                let sdk_client =
+                    crate::common::tokio_block_on(async { crate::common::s3::get_test_sdk_client(&region).await });
+                fuse::s3_session::new_with_test_client(config, sdk_client, s3_path)
+            }
+            None => fuse::s3_session::new(scenario.name(), config),
         }
-        None => fuse::s3_session::new(scenario.name(), scenario.session_config()),
     };
     scenario.setup(&session);
 
