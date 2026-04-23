@@ -110,10 +110,11 @@ fn writer_loop(
     let mut iter: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         iter += 1;
-        // Namespace writer keys under a per-run nonce so they never collide with shared
-        // fixtures or leftover objects from prior runs.
+        // Namespace writer keys with a per-run nonce so they never collide with shared
+        // fixtures or leftover objects from prior runs. Flat (no '/') so we don't need to
+        // mkdir intermediate prefixes through mountpoint.
         let key = format!(
-            "ephemeral/mixed_rw/{}/w{writer_id:03}_i{iter:06}.bin",
+            "mixed_rw_ephemeral_{}_w{writer_id:03}_i{iter:06}.bin",
             test_objects::ephemeral_run_id()
         );
         let path = mount_path.join(&key);

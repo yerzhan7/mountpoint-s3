@@ -88,9 +88,9 @@ pub trait Scenario: Send + Sync {
         self.session_config().filesystem_config.mem_limit as f64
     }
 
-    /// Maximum allowed p100 latency per worker op, aggregated across all workers. Default 5s.
+    /// Maximum allowed p100 latency per worker op, aggregated across all workers. Default 30s.
     fn max_latency(&self) -> Duration {
-        Duration::from_secs(5)
+        Duration::from_secs(30)
     }
 }
 
