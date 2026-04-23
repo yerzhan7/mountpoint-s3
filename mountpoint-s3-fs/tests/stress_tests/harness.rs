@@ -490,13 +490,16 @@ fn dump_summary(scenario_name: &str, aggregate: &WorkerRecorder) {
                 if count == 0 {
                     println!("hist {key}: count=0");
                 } else {
+                    // Raw HDR values: unit varies per metric (bytes, µs, MiB, count, etc.) —
+                    // the caller interprets from the metric name. Formatting a single unit
+                    // here would be wrong for anything that isn't latency.
                     println!(
-                        "hist {key}: count={} p50={}ms p90={}ms p99={}ms p100={}ms",
+                        "hist {key}: count={} p50={} p90={} p99={} p100={}",
                         count,
-                        us_to_ms_str(h.value_at_quantile(0.50)),
-                        us_to_ms_str(h.value_at_quantile(0.90)),
-                        us_to_ms_str(h.value_at_quantile(0.99)),
-                        us_to_ms_str(h.max()),
+                        h.value_at_quantile(0.50),
+                        h.value_at_quantile(0.90),
+                        h.value_at_quantile(0.99),
+                        h.max(),
                     );
                 }
             }
