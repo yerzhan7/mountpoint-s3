@@ -84,4 +84,6 @@ jobs:
             --features stress_tests \
             --test-threads=1 \
             --run-ignored only \
+            --success-output final \
+            --failure-output final \
             'stress_tests::${{ matrix.scenario }}'
