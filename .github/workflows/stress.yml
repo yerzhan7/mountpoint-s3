@@ -23,9 +23,10 @@ env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
   # Emit info-level tracing so the end-of-run worker op table and global metrics dump
-  # (tracing::info!) are visible in CI logs. Without this the default EnvFilter is `warn`
-  # and the dumps are silently filtered out.
-  RUST_LOG: info
+  # (tracing::info!) are visible in CI logs. Silence awscrt at info so the CRT's TLS init
+  # line doesn't pollute nextest's test-listing stdout (nextest parses the test binary's
+  # --list output and any stray line makes it reject the whole list).
+  RUST_LOG: "info,awscrt=warn"
   # Reuse the bench bucket for fixture storage — shared stress test objects live at
   # `${S3_BUCKET_TEST_PREFIX}stress-fixtures/` and are never deleted.
   S3_BUCKET_NAME: ${{ vars.S3_BENCH_BUCKET_NAME }}
