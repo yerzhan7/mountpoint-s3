@@ -465,15 +465,15 @@ fn us_to_ms_str(us: u64) -> String {
 
 /// Print a per-op worker latency table followed by the global StressTestRecorder snapshot.
 fn dump_summary(scenario_name: &str, aggregate: &WorkerRecorder) {
-    println!("=== stress [{scenario_name}] worker op latencies ===");
+    tracing::info!("=== stress [{scenario_name}] worker op latencies ===");
     for op in Op::ALL {
         let h = aggregate.histogram(op);
         let count = h.len();
         if count == 0 {
-            println!("op={} count=0", op.name());
+            tracing::info!("op={} count=0", op.name());
             continue;
         }
-        println!(
+        tracing::info!(
             "op={} count={} p50={}ms p90={}ms p99={}ms p100={}ms",
             op.name(),
             count,
@@ -484,9 +484,9 @@ fn dump_summary(scenario_name: &str, aggregate: &WorkerRecorder) {
         );
     }
 
-    println!("=== stress [{scenario_name}] global metrics ===");
+    tracing::info!("=== stress [{scenario_name}] global metrics ===");
     let Some(recorder) = stress_recorder::recorder() else {
-        println!("(no global recorder installed)");
+        tracing::info!("(no global recorder installed)");
         return;
     };
     let mut snapshot = recorder.snapshot_all();
@@ -496,12 +496,12 @@ fn dump_summary(scenario_name: &str, aggregate: &WorkerRecorder) {
             StressMetricSnapshot::Histogram(h) => {
                 let count = h.len();
                 if count == 0 {
-                    println!("hist {key}: count=0");
+                    tracing::info!("hist {key}: count=0");
                 } else {
                     // Raw HDR values: unit varies per metric (bytes, µs, MiB, count, etc.) —
                     // the caller interprets from the metric name. Formatting a single unit
                     // here would be wrong for anything that isn't latency.
-                    println!(
+                    tracing::info!(
                         "hist {key}: count={} p50={} p90={} p99={} p100={}",
                         count,
                         h.value_at_quantile(0.50),
@@ -511,8 +511,8 @@ fn dump_summary(scenario_name: &str, aggregate: &WorkerRecorder) {
                     );
                 }
             }
-            StressMetricSnapshot::Counter(c) => println!("counter {key}: {c}"),
-            StressMetricSnapshot::Gauge(g) => println!("gauge {key}: {g}"),
+            StressMetricSnapshot::Counter(c) => tracing::info!("counter {key}: {c}"),
+            StressMetricSnapshot::Gauge(g) => tracing::info!("gauge {key}: {g}"),
         }
     }
 }
