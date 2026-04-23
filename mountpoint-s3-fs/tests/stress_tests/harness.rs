@@ -378,6 +378,13 @@ fn log_mem_metrics(scenario_name: &str) {
 /// Assert the true peak of `sum(mem.bytes_reserved)` over the whole run stayed at or below
 /// `ceiling`. The peak comes from each gauge's post-mutation history, so no samples can be
 /// missed between allocation spikes.
+///
+/// The invariant uses the raw `mem_limit` as the ceiling. Mountpoint's memory limiter
+/// actually enforces a tighter effective budget: `mem.bytes_reserved + pool.reserved_bytes +
+/// additional_mem_reserved <= mem_limit`, where `additional_mem_reserved = max(mem_limit/8,
+/// 128 MiB)`. We log the effective-budget overshoot for visibility but do not fail on it —
+/// several reserve paths are unconditional (bypass the limit check) by design, and tightening
+/// the assertion today would only surface known memory-limiter gaps.
 fn assert_peak_reserved_invariant(scenario_name: &str, ceiling: f64) {
     let Some(recorder) = stress_recorder::recorder() else {
         tracing::warn!(
@@ -398,10 +405,19 @@ fn assert_peak_reserved_invariant(scenario_name: &str, ceiling: f64) {
     // we don't have — but summing per-area peaks gives an upper bound of the true peak sum,
     // which is exactly what we want for an "at or below ceiling" invariant.
     let peak_upper_bound: u64 = per_area_peak.iter().map(|(_, v)| *v).sum();
+
+    // Informational: what the limiter's effective budget actually is, and by how much the
+    // observed peak exceeded that budget (if at all). Not asserted — see function doc.
+    let mem_limit = ceiling as u64;
+    let additional_mem_reserved = (mem_limit / 8).max(128 * 1024 * 1024);
+    let effective_budget = mem_limit.saturating_sub(additional_mem_reserved);
+    let overshoot = peak_upper_bound.saturating_sub(effective_budget);
     tracing::info!(
         scenario = scenario_name,
         peak_reserved_bytes = peak_upper_bound,
         ceiling_bytes = ceiling,
+        effective_budget_bytes = effective_budget,
+        effective_budget_overshoot_bytes = overshoot,
         ?per_area_peak,
         "stress: peak mem.bytes_reserved"
     );
