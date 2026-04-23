@@ -412,24 +412,28 @@ fn assert_peak_reserved_invariant(scenario_name: &str, ceiling: f64) {
     let additional_mem_reserved = (mem_limit / 8).max(128 * 1024 * 1024);
     let effective_budget = mem_limit.saturating_sub(additional_mem_reserved);
     let overshoot = peak_upper_bound.saturating_sub(effective_budget);
+    let per_area_peak_mib: Vec<(&'static str, String)> = per_area_peak
+        .iter()
+        .map(|(a, v)| (*a, format_mib(*v)))
+        .collect();
     if overshoot > 0 {
         tracing::warn!(
             scenario = scenario_name,
-            peak_reserved_bytes = peak_upper_bound,
-            ceiling_bytes = ceiling,
-            effective_budget_bytes = effective_budget,
-            effective_budget_overshoot_bytes = overshoot,
-            ?per_area_peak,
+            peak_reserved = %format_mib(peak_upper_bound),
+            ceiling = %format_mib(mem_limit),
+            effective_budget = %format_mib(effective_budget),
+            effective_budget_overshoot = %format_mib(overshoot),
+            ?per_area_peak_mib,
             "stress: peak mem.bytes_reserved exceeds effective budget (mem_limit - additional_mem_reserved)"
         );
     } else {
         tracing::info!(
             scenario = scenario_name,
-            peak_reserved_bytes = peak_upper_bound,
-            ceiling_bytes = ceiling,
-            effective_budget_bytes = effective_budget,
-            effective_budget_overshoot_bytes = overshoot,
-            ?per_area_peak,
+            peak_reserved = %format_mib(peak_upper_bound),
+            ceiling = %format_mib(mem_limit),
+            effective_budget = %format_mib(effective_budget),
+            effective_budget_overshoot = %format_mib(overshoot),
+            ?per_area_peak_mib,
             "stress: peak mem.bytes_reserved"
         );
     }
@@ -482,6 +486,11 @@ fn read_mem_bytes_reserved(recorder: &StressTestRecorder) -> Vec<(&'static str, 
 /// Format a microsecond value as milliseconds with one decimal place.
 fn us_to_ms_str(us: u64) -> String {
     format!("{:.1}", us as f64 / 1000.0)
+}
+
+/// Format a byte count as `<value> MiB` with one decimal place, for readable log output.
+fn format_mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
 /// Print a per-op worker latency table followed by the global StressTestRecorder snapshot.
