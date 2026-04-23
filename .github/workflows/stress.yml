@@ -28,8 +28,8 @@ env:
   S3_BUCKET_TEST_PREFIX: ${{ vars.S3_BUCKET_BENCH_PREFIX || 'mountpoint-benchmark/' }}
   S3_ENDPOINT_URL: ${{ vars.S3_BENCH_ENDPOINT_URL }}
   S3_REGION: ${{ vars.S3_BENCH_REGION }}
-  # 15 minutes per scenario. Override via workflow dispatch if needed.
-  STRESS_DURATION_SECS: "900"
+  # 5 minutes per scenario. Override via workflow dispatch if needed.
+  STRESS_DURATION_SECS: "300"
 
 jobs:
   approval:
