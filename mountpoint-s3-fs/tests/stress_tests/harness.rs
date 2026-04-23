@@ -47,10 +47,11 @@ pub trait Scenario: Send + Sync {
     fn name(&self) -> &str;
 
     /// Maximum time worker `worker_id` may go without incrementing its progress counter
-    /// before the watchdog declares it stalled. The default is 10s for all workers. The
-    /// API still supports per-worker thresholds for scenarios that need them.
+    /// before the watchdog declares it stalled. The default is 30s for all workers (closes
+    /// of large write objects can legitimately take many seconds). The API still supports
+    /// per-worker thresholds for scenarios that need them.
     fn max_idle_duration(&self, _worker_id: usize) -> Duration {
-        Duration::from_secs(10)
+        Duration::from_secs(30)
     }
 
     /// Number of worker threads to spawn.

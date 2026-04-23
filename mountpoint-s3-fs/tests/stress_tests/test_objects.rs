@@ -37,6 +37,25 @@ pub fn small_object_key(index: usize) -> String {
     format!("small_{index:04}.bin")
 }
 
+/// A process-wide, per-run nonce directory segment for ephemeral writer objects.
+///
+/// Scenarios that mount against [`shared_s3_path`] must place their writable output under
+/// `ephemeral/<scenario>/<ephemeral_run_id>/...` so they cannot collide with either the
+/// shared fixtures or leftover objects from prior runs. The returned string does not contain
+/// path separators and is stable for the lifetime of the test process.
+pub fn ephemeral_run_id() -> &'static str {
+    use std::sync::OnceLock;
+    static RUN_ID: OnceLock<String> = OnceLock::new();
+    RUN_ID.get_or_init(|| {
+        // Seed a short, collision-resistant-enough id from the system clock + pid.
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{:016x}-{}", now_ns, std::process::id())
+    })
+}
+
 /// Return the shared prefix (e.g. `mountpoint-test/stress-fixtures/`).
 fn shared_prefix_string() -> String {
     let base = std::env::var("S3_BUCKET_TEST_PREFIX").unwrap_or_else(|_| String::from("mountpoint-test/"));

@@ -16,7 +16,6 @@ use mountpoint_s3_fs::s3::S3Path;
 use crate::common::fuse::{TestSession, TestSessionConfig};
 use crate::stress_tests::harness::{self, Op, Scenario, WorkerRecorder};
 use crate::stress_tests::test_objects::{self, READ_OBJECT_KEY};
-
 const NUM_READERS: usize = 16;
 const NUM_WRITERS: usize = 24;
 const READ_CHUNK: usize = 8 * 1024 * 1024; // 8 MiB — matches default part size
@@ -111,8 +110,12 @@ fn writer_loop(
     let mut iter: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         iter += 1;
-        // Namespace writer keys so they cannot collide with shared test objects.
-        let key = format!("mixed_rw_ephemeral_w{writer_id:03}_i{iter:06}.bin");
+        // Namespace writer keys under a per-run nonce so they never collide with shared
+        // fixtures or leftover objects from prior runs.
+        let key = format!(
+            "ephemeral/mixed_rw/{}/w{writer_id:03}_i{iter:06}.bin",
+            test_objects::ephemeral_run_id()
+        );
         let path = mount_path.join(&key);
 
         let mut file = recorder
