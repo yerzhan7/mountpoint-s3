@@ -540,7 +540,7 @@ fn format_mib(bytes: u64) -> String {
 
 /// Print a per-op worker latency table followed by the global HdrRecorder snapshot.
 fn dump_summary(scenario_name: &str, aggregate: &FileOpLatencies) {
-    tracing::info!("=== STRESS [{scenario_name}] WORKER OP LATENCIES ===");
+    tracing::info!("=== STRESS [{scenario_name}] FILE OP LATENCIES ===");
     for op in FileOp::ALL {
         let h = aggregate.histogram(op);
         let count = h.len();

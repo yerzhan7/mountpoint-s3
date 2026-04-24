@@ -176,7 +176,7 @@ At teardown the harness prints (via `tracing::info!`):
    p50/p90/p99/p100 in ms, e.g.
 
    ```
-   === STRESS [sustained_reads] WORKER OP LATENCIES ===
+   === STRESS [sustained_reads] FILE OP LATENCIES ===
    op=open count=96 p50=475.6ms p90=536.6ms p99=536.6ms p100=536.6ms
    op=read count=9664 p50=965.1ms p90=1264.6ms p99=1612.8ms p100=1946.6ms
    op=write count=0
