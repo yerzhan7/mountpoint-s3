@@ -24,6 +24,8 @@ fn lookup<M>(map: &DashMap<Key, Arc<M>>, name: &str, labels: &[(&str, &str)]) ->
         .map(|entry| Arc::clone(entry.value()))
 }
 
+/// Simple `Mutex`-backed metrics storage; intended for low-contention functional tests where
+/// code clarity beats throughput. For high-contention stress runs use [`stress::HdrRecorder`].
 #[derive(Debug, Default, Clone)]
 pub struct TestRecorder {
     metrics: Arc<DashMap<Key, Arc<Metric>>>,
@@ -203,6 +205,9 @@ pub mod stress {
         }
     }
 
+    /// Lock-free counters + HDR-backed histograms and gauge history; intended for long,
+    /// high-contention stress runs where recorder overhead must be bounded. For low-contention
+    /// functional tests use [`super::TestRecorder`].
     #[derive(Debug, Default, Clone)]
     pub struct HdrRecorder {
         metrics: Arc<DashMap<Key, Arc<HdrMetric>>>,
