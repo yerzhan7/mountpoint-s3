@@ -12,12 +12,20 @@ bugs in the memory limiter and pruner.
 - No per-worker stall longer than `Scenario::max_idle_duration(worker_id)`.
   The default is 30 s for every worker; the API still supports per-worker
   thresholds for scenarios that need them.
-- At teardown, `sum(mem.bytes_reserved)` across all areas is exactly zero —
-  every reservation must have been released once the mount is dropped.
-- During the run, the true peak of `sum(mem.bytes_reserved)` never exceeds
-  the configured `mem_limit` (512 MiB for these tests). The peak is
-  reconstructed from the per-gauge HDR history so no spike between samples
-  can be missed.
+- At teardown, each reservation gauge is exactly zero — every reservation
+  must be released once the mount is dropped. Checked per-label for:
+  - `mem.bytes_reserved{area=upload|prefetch}` (Mountpoint's limiter).
+  - `pool.reserved_bytes{kind=get_object|put_object|disk_cache|append|other}`
+    (CRT paged-pool occupancy).
+- During the run, each individual reservation gauge's peak stays under its
+  ceiling. Per-label peaks come from the gauge's HDR history so no spike
+  between samples can be missed:
+  - `mem.bytes_reserved{area=*}` peak ≤ `mem_limit - additional_mem_reserved`
+    (the effective budget the limiter enforces, ~384 MiB on a 512 MiB limit).
+  - `pool.reserved_bytes{kind=*}` peak ≤ `mem_limit` (512 MiB).
+  Peaks are not summed across labels — summing per-label peaks over-
+  estimates the true peak of the sum, and per-label checks give sharper
+  failure attribution.
 - For each worker op (`open`, `read`, `write`, `close`) aggregated across
   every worker, the p100 latency is within `Scenario::max_latency()`. Default
   is 30 s; ops with zero samples are skipped.

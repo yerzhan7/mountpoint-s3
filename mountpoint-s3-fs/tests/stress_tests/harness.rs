@@ -12,7 +12,7 @@ use mountpoint_s3_fs::s3::S3Path;
 
 use crate::common::fuse::{self, TestSession, TestSessionConfig};
 use crate::common::stress_recorder;
-use crate::common::test_recorder::stress::{HdrMetric, HdrRecorder};
+use crate::common::test_recorder::stress::HdrMetric;
 
 use hdrhistogram::Histogram as HdrHistogram;
 
@@ -65,8 +65,8 @@ pub trait Scenario: Send + Sync {
         stop: &AtomicBool,
     );
 
-    /// Expected peak `sum(mem.bytes_reserved)` ceiling in bytes. Defaults to
-    /// `session_config().filesystem_config.mem_limit`.
+    /// Raw `mem_limit` used to derive per-metric ceilings. Defaults to
+    /// `session_config().filesystem_config.mem_limit`. See [`assert_peak_reserved_invariant`].
     fn peak_reserved_ceiling_bytes(&self) -> f64 {
         self.session_config().filesystem_config.mem_limit as f64
     }
@@ -291,17 +291,21 @@ fn read_duration_env() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Assert the true peak of `sum(mem.bytes_reserved)` over the whole run stayed at or below
-/// `ceiling`. The peak comes from each gauge's post-mutation history, so no samples can be
-/// missed between allocation spikes.
+const MEM_AREAS: &[&str] = &["upload", "prefetch"];
+const POOL_KINDS: &[&str] = &["get_object", "put_object", "disk_cache", "append", "other"];
+
+/// Assert each individual reserved-memory gauge stayed below its appropriate ceiling over
+/// the whole run:
 ///
-/// The invariant uses the raw `mem_limit` as the ceiling. Mountpoint's memory limiter
-/// actually enforces a tighter effective budget: `mem.bytes_reserved + pool.reserved_bytes +
-/// additional_mem_reserved <= mem_limit`, where `additional_mem_reserved = max(mem_limit/8,
-/// 128 MiB)`. We log the effective-budget overshoot for visibility but do not fail on it —
-/// several reserve paths are unconditional (bypass the limit check) by design, and tightening
-/// the assertion today would only surface known memory-limiter gaps.
-fn assert_peak_reserved_invariant(scenario_name: &str, ceiling: f64) {
+/// * `mem.bytes_reserved{area=*}` (Mountpoint's own limiter-tracked reservations) <=
+///   `mem_limit - additional_mem_reserved` (the effective budget the limiter enforces against).
+/// * `pool.reserved_bytes{kind=*}` (CRT paged-pool occupancy) <= `mem_limit`.
+///
+/// Peaks come from each gauge's post-mutation HDR history, so no samples are missed between
+/// allocation spikes. We deliberately do not assert the sum across labels — the peaks are
+/// independent time series and summing their maxes overestimates the true peak of the sum.
+/// Per-label checks give clearer failure attribution (which area / which kind breached).
+fn assert_peak_reserved_invariant(scenario_name: &str, mem_limit: f64) {
     let Some(recorder) = stress_recorder::recorder() else {
         tracing::warn!(
             scenario = scenario_name,
@@ -309,59 +313,61 @@ fn assert_peak_reserved_invariant(scenario_name: &str, ceiling: f64) {
         );
         return;
     };
-    let per_area_peak: Vec<(&'static str, u64)> = ["upload", "prefetch"]
-        .into_iter()
-        .filter_map(|area| {
-            recorder
-                .get("mem.bytes_reserved", &[("area", area)])
-                .map(|metric| (area, metric.gauge_history().max()))
-        })
-        .collect();
-    // The real peak of `sum(gauges)` requires point-in-time correlation across areas, which
-    // we don't have — but summing per-area peaks gives an upper bound of the true peak sum,
-    // which is exactly what we want for an "at or below ceiling" invariant.
-    let peak_upper_bound: u64 = per_area_peak.iter().map(|(_, v)| *v).sum();
+    let mem_limit_u64 = mem_limit as u64;
+    let additional_mem_reserved = (mem_limit_u64 / 8).max(128 * 1024 * 1024);
+    let effective_budget = mem_limit_u64.saturating_sub(additional_mem_reserved);
 
-    // Informational: what the limiter's effective budget actually is, and by how much the
-    // observed peak exceeded that budget (if at all). Not asserted — see function doc.
-    let mem_limit = ceiling as u64;
-    let additional_mem_reserved = (mem_limit / 8).max(128 * 1024 * 1024);
-    let effective_budget = mem_limit.saturating_sub(additional_mem_reserved);
-    let overshoot = peak_upper_bound.saturating_sub(effective_budget);
-    let per_area_peak_mib: Vec<(&'static str, String)> = per_area_peak
-        .iter()
-        .map(|(a, v)| (*a, format_mib(*v)))
-        .collect();
-    if overshoot > 0 {
-        tracing::warn!(
-            scenario = scenario_name,
-            peak_reserved = %format_mib(peak_upper_bound),
-            ceiling = %format_mib(mem_limit),
-            effective_budget = %format_mib(effective_budget),
-            effective_budget_overshoot = %format_mib(overshoot),
-            ?per_area_peak_mib,
-            "stress: peak mem.bytes_reserved exceeds effective budget (mem_limit - additional_mem_reserved)"
-        );
-    } else {
+    let mut violations: Vec<String> = Vec::new();
+    for &area in MEM_AREAS {
+        let Some(metric) = recorder.get("mem.bytes_reserved", &[("area", area)]) else {
+            continue;
+        };
+        let peak = metric.gauge_history().max();
         tracing::info!(
             scenario = scenario_name,
-            peak_reserved = %format_mib(peak_upper_bound),
-            ceiling = %format_mib(mem_limit),
-            effective_budget = %format_mib(effective_budget),
-            effective_budget_overshoot = %format_mib(overshoot),
-            ?per_area_peak_mib,
+            area = area,
+            peak = %format_mib(peak),
+            ceiling = %format_mib(effective_budget),
             "stress: peak mem.bytes_reserved"
         );
+        if peak > effective_budget {
+            violations.push(format!(
+                "mem.bytes_reserved{{area={area}}} peak {} exceeds effective budget {}",
+                format_mib(peak),
+                format_mib(effective_budget),
+            ));
+        }
+    }
+    for &kind in POOL_KINDS {
+        let Some(metric) = recorder.get("pool.reserved_bytes", &[("kind", kind)]) else {
+            continue;
+        };
+        let peak = metric.gauge_history().max();
+        tracing::info!(
+            scenario = scenario_name,
+            kind = kind,
+            peak = %format_mib(peak),
+            ceiling = %format_mib(mem_limit_u64),
+            "stress: peak pool.reserved_bytes"
+        );
+        if peak > mem_limit_u64 {
+            violations.push(format!(
+                "pool.reserved_bytes{{kind={kind}}} peak {} exceeds mem_limit {}",
+                format_mib(peak),
+                format_mib(mem_limit_u64),
+            ));
+        }
     }
     assert!(
-        (peak_upper_bound as f64) <= ceiling,
-        "peak-reserved invariant violated: peak sum(mem.bytes_reserved) = {} bytes exceeds ceiling {} bytes (per-area peaks: {:?})",
-        peak_upper_bound,
-        ceiling,
-        per_area_peak,
+        violations.is_empty(),
+        "peak-reserved invariant violated:\n  {}",
+        violations.join("\n  "),
     );
 }
 
+/// After the session is dropped, every reservation-tracking gauge must be back to zero.
+/// Checks both `mem.bytes_reserved{area=*}` (limiter-tracked) and `pool.reserved_bytes{kind=*}`
+/// (CRT pool occupancy); a non-zero value means we leaked a reservation or a pool buffer.
 fn assert_teardown_invariants(scenario_name: &str) {
     let Some(recorder) = stress_recorder::recorder() else {
         tracing::warn!(
@@ -370,32 +376,26 @@ fn assert_teardown_invariants(scenario_name: &str) {
         );
         return;
     };
-    let per_area = read_mem_bytes_reserved(recorder);
-    let total: f64 = per_area.iter().map(|(_, v)| *v).sum();
-    tracing::info!(
-        scenario = scenario_name,
-        total_reserved_bytes = total,
-        ?per_area,
-        "stress: teardown mem.bytes_reserved"
-    );
-    assert!(
-        total == 0.0,
-        "teardown invariant violated: sum(mem.bytes_reserved) = {} bytes (per-area: {:?})",
-        total,
-        per_area,
-    );
-}
-
-/// Return `(area_label, gauge_value)` pairs for each `mem.bytes_reserved{area=...}` we know about.
-fn read_mem_bytes_reserved(recorder: &HdrRecorder) -> Vec<(&'static str, f64)> {
-    ["upload", "prefetch"]
-        .into_iter()
-        .filter_map(|area| {
-            recorder
-                .get("mem.bytes_reserved", &[("area", area)])
-                .map(|metric| (area, metric.gauge()))
-        })
-        .collect()
+    let mut leaks: Vec<String> = Vec::new();
+    for &area in MEM_AREAS {
+        if let Some(metric) = recorder.get("mem.bytes_reserved", &[("area", area)]) {
+            let v = metric.gauge();
+            tracing::info!(scenario = scenario_name, area, value = v, "stress: teardown mem.bytes_reserved");
+            if v != 0.0 {
+                leaks.push(format!("mem.bytes_reserved{{area={area}}} = {v}"));
+            }
+        }
+    }
+    for &kind in POOL_KINDS {
+        if let Some(metric) = recorder.get("pool.reserved_bytes", &[("kind", kind)]) {
+            let v = metric.gauge();
+            tracing::info!(scenario = scenario_name, kind, value = v, "stress: teardown pool.reserved_bytes");
+            if v != 0.0 {
+                leaks.push(format!("pool.reserved_bytes{{kind={kind}}} = {v}"));
+            }
+        }
+    }
+    assert!(leaks.is_empty(), "teardown invariant violated:\n  {}", leaks.join("\n  "));
 }
 
 /// Format a microsecond value as milliseconds with one decimal place.
@@ -558,7 +558,7 @@ mod tests {
             stop.clone(),
             stalled.clone(),
         )
-        .expect("watchdog disabled via env");
+        ;
         wd.join().unwrap();
         assert_eq!(stalled.load(Ordering::SeqCst), 0);
         assert!(stop.load(Ordering::SeqCst));
@@ -576,7 +576,7 @@ mod tests {
             stop.clone(),
             stalled.clone(),
         )
-        .expect("watchdog disabled via env");
+        ;
 
         // Drive progress on both workers for ~1.5s, then stop.
         let deadline = Instant::now() + Duration::from_millis(1500);
@@ -603,7 +603,7 @@ mod tests {
             stop.clone(),
             stalled.clone(),
         )
-        .expect("watchdog disabled via env");
+        ;
 
         // Worker 0 advances, worker 1 stays idle.
         let deadline = Instant::now() + Duration::from_millis(1500);
@@ -631,7 +631,7 @@ mod tests {
             stop.clone(),
             stalled.clone(),
         )
-        .expect("watchdog disabled via env");
+        ;
         wd.join().unwrap();
         assert_eq!(stalled.load(Ordering::SeqCst), 1, "worker 1 should be flagged first");
     }
