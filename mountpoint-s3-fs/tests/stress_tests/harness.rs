@@ -241,7 +241,7 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
     dump_summary(scenario.name(), &aggregate);
 
     tracing::info!("");
-    tracing::info!("=== stress [{}] invariant assertions ===", scenario.name());
+    tracing::info!("=== STRESS [{}] INVARIANT ASSERTIONS ===", scenario.name());
     assert_peak_reserved_invariant(scenario.name(), scenario.peak_reserved_ceiling_bytes());
     assert_peak_rss_invariant(scenario.name(), scenario.peak_reserved_ceiling_bytes());
     assert_teardown_invariants(scenario.name());
@@ -331,8 +331,29 @@ fn read_duration_env() -> Duration {
     Duration::from_secs(secs)
 }
 
-const MEM_AREAS: &[&str] = &["upload", "prefetch"];
-const POOL_KINDS: &[&str] = &["get_object", "put_object", "disk_cache", "append", "other"];
+/// Collect `(label_value, &HdrMetric)` for every registered gauge whose name matches
+/// `metric_name` and that carries a label keyed on `label_key`. Lets invariant checks
+/// auto-discover new `area=` / `kind=` values instead of hardcoding the allowlist.
+fn collect_gauges_by_label(
+    recorder: &crate::common::test_recorder::stress::HdrRecorder,
+    metric_name: &str,
+    label_key: &str,
+) -> Vec<(String, Arc<HdrMetric>)> {
+    let mut out = Vec::new();
+    recorder.for_each(|key, _| {
+        if key.name() != metric_name {
+            return;
+        }
+        let Some(label_value) = key.labels().find(|l| l.key() == label_key).map(|l| l.value().to_string()) else {
+            return;
+        };
+        if let Some(metric) = recorder.get(metric_name, &[(label_key, label_value.as_str())]) {
+            out.push((label_value, metric));
+        }
+    });
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
 
 /// Assert each individual reserved-memory gauge stayed below the effective budget the
 /// limiter enforces against (`mem_limit - additional_mem_reserved`):
@@ -362,14 +383,11 @@ fn assert_peak_reserved_invariant(scenario_name: &str, mem_limit: f64) {
     let effective_budget = mem_limit_u64.saturating_sub(additional_mem_reserved);
 
     let mut violations: Vec<String> = Vec::new();
-    for &area in MEM_AREAS {
-        let Some(metric) = recorder.get("mem.bytes_reserved", &[("area", area)]) else {
-            continue;
-        };
+    for (area, metric) in collect_gauges_by_label(&recorder, "mem.bytes_reserved", "area") {
         let peak = metric.gauge_history().max();
         tracing::info!(
             scenario = scenario_name,
-            area = area,
+            area = %area,
             peak = %format_mib(peak),
             ceiling = %format_mib(effective_budget),
             "stress: peak mem.bytes_reserved"
@@ -382,14 +400,11 @@ fn assert_peak_reserved_invariant(scenario_name: &str, mem_limit: f64) {
             ));
         }
     }
-    for &kind in POOL_KINDS {
-        let Some(metric) = recorder.get("pool.reserved_bytes", &[("kind", kind)]) else {
-            continue;
-        };
+    for (kind, metric) in collect_gauges_by_label(&recorder, "pool.reserved_bytes", "kind") {
         let peak = metric.gauge_history().max();
         tracing::info!(
             scenario = scenario_name,
-            kind = kind,
+            kind = %kind,
             peak = %format_mib(peak),
             ceiling = %format_mib(effective_budget),
             "stress: peak pool.reserved_bytes"
@@ -405,10 +420,10 @@ fn assert_peak_reserved_invariant(scenario_name: &str, mem_limit: f64) {
     // TODO(mem-limiter): promote from warn to assert once production accounting is tight
     // enough that breaches indicate real regressions rather than known-gap overshoot.
     if !violations.is_empty() {
-        tracing::warn!(
+        tracing::error!(
             scenario = scenario_name,
             ?violations,
-            "stress: assertion FAILED (warn-only) — peak-reserved invariant (ceiling {})",
+            "stress: assertion FAILED — peak-reserved invariant (ceiling {})",
             format_mib(effective_budget),
         );
     } else {
@@ -457,10 +472,10 @@ fn assert_peak_rss_invariant(scenario_name: &str, ceiling_bytes: f64) {
     // TODO(mem-limiter): promote from warn to assert once production accounting is tight
     // enough that breaches indicate real regressions rather than known-gap overshoot.
     if !violations.is_empty() {
-        tracing::warn!(
+        tracing::error!(
             scenario = scenario_name,
             ?violations,
-            "stress: assertion FAILED (warn-only) — peak-rss invariant (ceiling {})",
+            "stress: assertion FAILED — peak-rss invariant (ceiling {})",
             format_mib(ceiling),
         );
     } else {
@@ -484,22 +499,18 @@ fn assert_teardown_invariants(scenario_name: &str) {
         return;
     };
     let mut leaks: Vec<String> = Vec::new();
-    for &area in MEM_AREAS {
-        if let Some(metric) = recorder.get("mem.bytes_reserved", &[("area", area)]) {
-            let v = metric.gauge();
-            tracing::info!(scenario = scenario_name, area, value = v, "stress: teardown mem.bytes_reserved");
-            if v != 0.0 {
-                leaks.push(format!("mem.bytes_reserved{{area={area}}} = {v}"));
-            }
+    for (area, metric) in collect_gauges_by_label(&recorder, "mem.bytes_reserved", "area") {
+        let v = metric.gauge();
+        tracing::info!(scenario = scenario_name, area = %area, value = v, "stress: teardown mem.bytes_reserved");
+        if v != 0.0 {
+            leaks.push(format!("mem.bytes_reserved{{area={area}}} = {v}"));
         }
     }
-    for &kind in POOL_KINDS {
-        if let Some(metric) = recorder.get("pool.reserved_bytes", &[("kind", kind)]) {
-            let v = metric.gauge();
-            tracing::info!(scenario = scenario_name, kind, value = v, "stress: teardown pool.reserved_bytes");
-            if v != 0.0 {
-                leaks.push(format!("pool.reserved_bytes{{kind={kind}}} = {v}"));
-            }
+    for (kind, metric) in collect_gauges_by_label(&recorder, "pool.reserved_bytes", "kind") {
+        let v = metric.gauge();
+        tracing::info!(scenario = scenario_name, kind = %kind, value = v, "stress: teardown pool.reserved_bytes");
+        if v != 0.0 {
+            leaks.push(format!("pool.reserved_bytes{{kind={kind}}} = {v}"));
         }
     }
     if leaks.is_empty() {
@@ -529,7 +540,7 @@ fn format_mib(bytes: u64) -> String {
 
 /// Print a per-op worker latency table followed by the global HdrRecorder snapshot.
 fn dump_summary(scenario_name: &str, aggregate: &OpLatencies) {
-    tracing::info!("=== stress [{scenario_name}] worker op latencies ===");
+    tracing::info!("=== STRESS [{scenario_name}] WORKER OP LATENCIES ===");
     for op in Op::ALL {
         let h = aggregate.histogram(op);
         let count = h.len();
@@ -549,7 +560,7 @@ fn dump_summary(scenario_name: &str, aggregate: &OpLatencies) {
     }
 
     tracing::info!("");
-    tracing::info!("=== stress [{scenario_name}] global metrics ===");
+    tracing::info!("=== STRESS [{scenario_name}] GLOBAL METRICS ===");
     let Some(recorder) = stress_recorder::recorder() else {
         tracing::info!("(no global recorder installed)");
         return;
