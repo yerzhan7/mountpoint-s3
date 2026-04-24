@@ -27,8 +27,10 @@ bugs in the memory limiter and pruner.
   estimates the true peak of the sum, and per-label checks give sharper
   failure attribution.
 - For each worker op (`open`, `read`, `write`, `close`) aggregated across
-  every worker, the p100 latency is within `Scenario::max_latency()`. Default
-  is 30 s; ops with zero samples are skipped.
+  every worker, the p100 latency is within `Scenario::max_latency(op)`.
+  Default is 30 s for every op; scenarios can override per op (mirrors the
+  per-worker `max_idle_duration(worker_id)` shape). Ops with zero samples
+  are skipped.
 
 **What these tests do _not_ check:**
 
@@ -195,7 +197,7 @@ At teardown the harness prints (via `tracing::info!`):
 1. Create `tests/stress_tests/my_scenario.rs`.
 2. Implement `crate::stress_tests::harness::Scenario`: at minimum `name`,
    `num_workers`, `session_config`, and `run_worker`. Override
-   `max_idle_duration`, `max_latency`, `s3_path_override`,
+   `max_idle_duration`, `max_latency` (takes a `FileOp`), `s3_path_override`,
    `peak_reserved_ceiling_bytes`, and `setup` only if the defaults don't fit.
 3. `run_worker` has the signature
 

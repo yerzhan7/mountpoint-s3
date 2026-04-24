@@ -73,8 +73,10 @@ pub trait Scenario: Send + Sync {
         self.session_config().filesystem_config.mem_limit as f64
     }
 
-    /// Maximum allowed p100 latency per worker op, aggregated across all workers. Default 30s.
-    fn max_latency(&self) -> Duration {
+    /// Maximum allowed p100 latency for `op`, aggregated across all workers. Default 30s for
+    /// every op; scenarios override per op when they have different natural profiles (e.g.
+    /// `open`/`close` on S3 cover create + flush/MPU-complete and run longer than `read`/`write`).
+    fn max_latency(&self, _op: FileOp) -> Duration {
         Duration::from_secs(30)
     }
 }
@@ -245,7 +247,7 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
     assert_peak_reserved_invariant(scenario.name(), scenario.peak_reserved_ceiling_bytes());
     assert_peak_rss_invariant(scenario.name(), scenario.peak_reserved_ceiling_bytes());
     assert_teardown_invariants(scenario.name());
-    assert_p100_latency(scenario.name(), &aggregate, scenario.max_latency());
+    assert_p100_latency(scenario.name(), &aggregate, |op| scenario.max_latency(op));
     tracing::info!("");
 
     tracing::info!(scenario = scenario.name(), "stress: finished");
@@ -610,16 +612,20 @@ fn dump_summary(scenario_name: &str, aggregate: &FileOpLatencies) {
     }
 }
 
-/// Assert that the merged per-op p100 latency is within `max_latency`. Ops with zero samples
-/// are skipped (e.g. read-only scenarios never record a write sample).
-fn assert_p100_latency(scenario_name: &str, aggregate: &FileOpLatencies, max_latency: Duration) {
-    let max_us = max_latency.as_micros().min(u64::MAX as u128) as u64;
+/// Assert that the merged per-op p100 latency is within `max_latency(op)`. Ops with zero
+/// samples are skipped (e.g. read-only scenarios never record a write sample).
+fn assert_p100_latency(
+    scenario_name: &str,
+    aggregate: &FileOpLatencies,
+    max_latency: impl Fn(FileOp) -> Duration,
+) {
     let mut violations: Vec<String> = Vec::new();
     for op in FileOp::ALL {
         let h = aggregate.histogram(op);
         if h.len() == 0 {
             continue;
         }
+        let max_us = max_latency(op).as_micros().min(u64::MAX as u128) as u64;
         let max_observed = h.max();
         if max_observed > max_us {
             violations.push(format!(
@@ -635,8 +641,7 @@ fn assert_p100_latency(scenario_name: &str, aggregate: &FileOpLatencies, max_lat
         tracing::error!(
             scenario = scenario_name,
             ?violations,
-            "stress: assertion FAILED — p100 latency invariant (ceiling {}ms)",
-            us_to_ms_str(max_us),
+            "stress: assertion FAILED — p100 latency invariant (per-op ceilings)",
         );
         panic!(
             "stress: scenario {:?} violated p100 latency ceiling:\n  {}",
@@ -646,8 +651,7 @@ fn assert_p100_latency(scenario_name: &str, aggregate: &FileOpLatencies, max_lat
     }
     tracing::info!(
         scenario = scenario_name,
-        "stress: assertion PASSED — p100 latency invariant (ceiling {}ms)",
-        us_to_ms_str(max_us),
+        "stress: assertion PASSED — p100 latency invariant (per-op ceilings)",
     );
 }
 
@@ -679,13 +683,27 @@ mod tests {
         let mut agg = FileOpLatencies::new();
         // Record a 6s read sample (in µs).
         agg.histograms[FileOp::Read as usize].record(6_000_000).unwrap();
-        assert_p100_latency("test", &agg, Duration::from_secs(5));
+        assert_p100_latency("test", &agg, |_| Duration::from_secs(5));
     }
 
     #[test]
     fn assert_p100_latency_skips_empty_ops() {
         let agg = FileOpLatencies::new();
-        assert_p100_latency("test", &agg, Duration::from_secs(5));
+        assert_p100_latency("test", &agg, |_| Duration::from_secs(5));
+    }
+
+    #[test]
+    #[should_panic(expected = "op=read")]
+    fn assert_p100_latency_respects_per_op_ceilings() {
+        // Open: 6s sample under a 10s ceiling → OK. Read: 2s sample over a 1s ceiling → violation.
+        let mut agg = FileOpLatencies::new();
+        agg.histograms[FileOp::Open as usize].record(6_000_000).unwrap();
+        agg.histograms[FileOp::Read as usize].record(2_000_000).unwrap();
+        assert_p100_latency("test", &agg, |op| match op {
+            FileOp::Open => Duration::from_secs(10),
+            FileOp::Read => Duration::from_secs(1),
+            _ => Duration::from_secs(30),
+        });
     }
 
     #[test]
