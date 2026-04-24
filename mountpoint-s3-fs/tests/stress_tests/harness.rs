@@ -331,12 +331,16 @@ fn read_duration_env() -> Duration {
 const MEM_AREAS: &[&str] = &["upload", "prefetch"];
 const POOL_KINDS: &[&str] = &["get_object", "put_object", "disk_cache", "append", "other"];
 
-/// Assert each individual reserved-memory gauge stayed below its appropriate ceiling over
-/// the whole run:
+/// Assert each individual reserved-memory gauge stayed below the effective budget the
+/// limiter enforces against (`mem_limit - additional_mem_reserved`):
 ///
-/// * `mem.bytes_reserved{area=*}` (Mountpoint's own limiter-tracked reservations) <=
-///   `mem_limit - additional_mem_reserved` (the effective budget the limiter enforces against).
-/// * `pool.reserved_bytes{kind=*}` (CRT paged-pool occupancy) <= `mem_limit`.
+/// * `mem.bytes_reserved{area=*}` — Mountpoint's own limiter-tracked reservations
+///   (prefetch GetObject/DiskCache, incremental uploader Append).
+/// * `pool.reserved_bytes{kind=*}` — CRT paged-pool occupancy. `additional_mem_reserved`
+///   is headroom for untracked usage (file handles, inodes, FUSE buffers, runtime), not
+///   for the pool; the pool is expected to honor the effective budget too. Today some
+///   pool kinds (notably `put_object`) are only indirectly gated via the prefetcher read
+///   window and can overshoot — see the warn-only note below.
 ///
 /// Peaks come from each gauge's post-mutation HDR history, so no samples are missed between
 /// allocation spikes. We deliberately do not assert the sum across labels — the peaks are
@@ -384,14 +388,14 @@ fn assert_peak_reserved_invariant(scenario_name: &str, mem_limit: f64) {
             scenario = scenario_name,
             kind = kind,
             peak = %format_mib(peak),
-            ceiling = %format_mib(mem_limit_u64),
+            ceiling = %format_mib(effective_budget),
             "stress: peak pool.reserved_bytes"
         );
-        if peak > mem_limit_u64 {
+        if peak > effective_budget {
             violations.push(format!(
-                "pool.reserved_bytes{{kind={kind}}} peak {} exceeds mem_limit {}",
+                "pool.reserved_bytes{{kind={kind}}} peak {} exceeds effective budget {}",
                 format_mib(peak),
-                format_mib(mem_limit_u64),
+                format_mib(effective_budget),
             ));
         }
     }
