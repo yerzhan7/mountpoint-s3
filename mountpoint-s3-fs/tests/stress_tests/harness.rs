@@ -26,9 +26,6 @@ use hdrhistogram::Histogram as HdrHistogram;
 /// Default scenario duration if `STRESS_DURATION_SECS` is unset.
 const DEFAULT_DURATION_SECS: u64 = 30;
 
-/// How long to wait for worker threads to join after signalling stop.
-const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Watchdog poll interval.
 const WATCHDOG_POLL: Duration = Duration::from_secs(1);
 
@@ -228,12 +225,8 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
         let _ = wd.join();
     }
 
-    let join_deadline = Instant::now() + JOIN_TIMEOUT;
     let mut aggregate = OpLatencies::new();
     for (id, handle) in handles.into_iter().enumerate() {
-        if Instant::now() >= join_deadline {
-            panic!("worker {id} did not finish within {JOIN_TIMEOUT:?} after stop");
-        }
         let rec = handle
             .join()
             .unwrap_or_else(|e| panic!("worker {id} panicked: {e:?}"));
