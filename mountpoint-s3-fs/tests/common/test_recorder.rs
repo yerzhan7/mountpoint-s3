@@ -1,25 +1,42 @@
 //! Test utilities for metrics validation
 
+use dashmap::DashMap;
 use metrics::{
     Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, Recorder, SharedString, Unit,
 };
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+/// Return `Some(Arc<M>)` for the unique entry in `map` whose name is `name` and whose label
+/// set exactly matches `labels`. Shared by `TestRecorder` and `StressTestRecorder`.
+fn lookup<M>(map: &DashMap<Key, Arc<M>>, name: &str, labels: &[(&str, &str)]) -> Option<Arc<M>> {
+    map.iter()
+        .find(|entry| {
+            let key = entry.key();
+            if key.name() != name {
+                return false;
+            }
+            let actual: Vec<_> = key.labels().map(|l| (l.key(), l.value())).collect();
+            if actual.len() != labels.len() {
+                return false;
+            }
+            labels.iter().all(|(k, v)| actual.contains(&(*k, *v)))
+        })
+        .map(|entry| Arc::clone(entry.value()))
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct TestRecorder {
-    metrics: Arc<Mutex<HashMap<Key, Arc<Metric>>>>,
+    metrics: Arc<DashMap<Key, Arc<Metric>>>,
 }
 
 impl TestRecorder {
     pub fn clear(&self) {
-        let mut metrics = self.metrics.lock().unwrap();
-        metrics.clear();
+        self.metrics.clear();
     }
 
     pub fn print_metrics(&self) {
-        let metrics = self.metrics.lock().unwrap();
-        for (key, metric) in metrics.iter() {
+        for entry in self.metrics.iter() {
+            let (key, metric) = (entry.key(), entry.value());
             match metric.as_ref() {
                 Metric::Histogram(h) => {
                     let h = h.lock().unwrap();
@@ -38,25 +55,7 @@ impl TestRecorder {
     }
 
     pub fn get(&self, name: &str, labels: &[(&str, &str)]) -> Option<Arc<Metric>> {
-        let metrics = self.metrics.lock().unwrap();
-        metrics
-            .iter()
-            .find(|(key, _)| {
-                if key.name() != name {
-                    return false;
-                }
-
-                let actual_labels: Vec<_> = key.labels().map(|l| (l.key(), l.value())).collect();
-
-                // Must have exact same number of labels
-                if actual_labels.len() != labels.len() {
-                    return false;
-                }
-
-                // Every expected label must be in the actual labels
-                labels.iter().all(|(k, v)| actual_labels.contains(&(*k, *v)))
-            })
-            .map(|(_, metric)| Arc::clone(metric))
+        lookup(&self.metrics, name, labels)
     }
 }
 
@@ -96,27 +95,30 @@ impl Recorder for TestRecorder {
     fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
 
     fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
-        let mut metrics = self.metrics.lock().unwrap();
-        let metric = metrics
+        let metric = self
+            .metrics
             .entry(key.clone())
-            .or_insert(Arc::new(Metric::Counter(Default::default())));
-        Counter::from_arc(metric.clone())
+            .or_insert_with(|| Arc::new(Metric::Counter(Default::default())))
+            .clone();
+        Counter::from_arc(metric)
     }
 
     fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
-        let mut metrics = self.metrics.lock().unwrap();
-        let metric = metrics
+        let metric = self
+            .metrics
             .entry(key.clone())
-            .or_insert(Arc::new(Metric::Gauge(Default::default())));
-        Gauge::from_arc(metric.clone())
+            .or_insert_with(|| Arc::new(Metric::Gauge(Default::default())))
+            .clone();
+        Gauge::from_arc(metric)
     }
 
     fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
-        let mut metrics = self.metrics.lock().unwrap();
-        let metric = metrics
+        let metric = self
+            .metrics
             .entry(key.clone())
-            .or_insert(Arc::new(Metric::Histogram(Default::default())));
-        Histogram::from_arc(metric.clone())
+            .or_insert_with(|| Arc::new(Metric::Histogram(Default::default())))
+            .clone();
+        Histogram::from_arc(metric)
     }
 }
 
@@ -170,13 +172,15 @@ impl HistogramFn for Metric {
     }
 }
 
-/// HDR-backed recorder used by stress tests. Histogram values are recorded as `u64`
-/// microseconds-ish: every `record(v)` clamps `v` to `[0, hist.high()]` and casts to `u64`.
-/// Counters and gauges behave identically to [`TestRecorder`].
+/// HDR-backed recorder used by stress tests. Histograms use `hdrhistogram` for bounded-memory
+/// percentile storage; counters are lock-free `AtomicU64` (matching prod); gauges keep both a
+/// current value and a full HDR history so assertions can read the true peak without sampling
+/// races (no prod analogue — see `StressMetric::Gauge`).
 #[cfg(feature = "stress_tests")]
 pub mod stress {
     use super::*;
     use hdrhistogram::Histogram as HdrHistogram;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Upper bound of the HDR histogram — 10 minutes expressed as µs. Records beyond this
     /// are clamped down so we never panic during recording.
@@ -186,38 +190,35 @@ pub mod stress {
         HdrHistogram::<u64>::new_with_bounds(1, HDR_HIGH, 3).expect("HDR bounds valid")
     }
 
+    /// Clamp an `f64` into `[0, high]` as `u64`. NaN and negatives become 0; values above
+    /// `high` become `high`. Used by both gauge-history recording and histogram sampling.
+    fn clamp_f64_to_u64(value: f64, high: u64) -> u64 {
+        if value.is_nan() || value < 0.0 {
+            0
+        } else if value > high as f64 {
+            high
+        } else {
+            value as u64
+        }
+    }
+
     #[derive(Debug, Default, Clone)]
     pub struct StressTestRecorder {
-        metrics: Arc<Mutex<HashMap<Key, Arc<StressMetric>>>>,
+        metrics: Arc<DashMap<Key, Arc<StressMetric>>>,
     }
 
     impl StressTestRecorder {
         pub fn get(&self, name: &str, labels: &[(&str, &str)]) -> Option<Arc<StressMetric>> {
-            let metrics = self.metrics.lock().unwrap();
-            metrics
-                .iter()
-                .find(|(key, _)| {
-                    if key.name() != name {
-                        return false;
-                    }
-                    let actual: Vec<_> = key.labels().map(|l| (l.key(), l.value())).collect();
-                    if actual.len() != labels.len() {
-                        return false;
-                    }
-                    labels.iter().all(|(k, v)| actual.contains(&(*k, *v)))
-                })
-                .map(|(_, metric)| Arc::clone(metric))
+            lookup(&self.metrics, name, labels)
         }
 
-        /// Clone out the current state of every registered metric. Holds the registry lock
-        /// only long enough to clone the per-metric `Arc`s; per-metric state is cloned
-        /// without holding the registry lock.
+        /// Clone out the current state of every registered metric. Per-metric state is
+        /// cloned through the `DashMap` iterator without holding a global lock.
         pub fn snapshot_all(&self) -> Vec<(Key, StressMetricSnapshot)> {
-            let entries: Vec<(Key, Arc<StressMetric>)> = {
-                let metrics = self.metrics.lock().unwrap();
-                metrics.iter().map(|(k, m)| (k.clone(), Arc::clone(m))).collect()
-            };
-            entries.into_iter().map(|(k, m)| (k, m.snapshot())).collect()
+            self.metrics
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.value().snapshot()))
+                .collect()
         }
     }
 
@@ -243,7 +244,7 @@ pub mod stress {
     #[derive(Debug)]
     pub enum StressMetric {
         Histogram(Mutex<HdrHistogram<u64>>),
-        Counter(Mutex<u64>),
+        Counter(AtomicU64),
         Gauge(Mutex<GaugeState>),
     }
 
@@ -280,7 +281,7 @@ pub mod stress {
 
         pub fn counter(&self) -> u64 {
             match self {
-                StressMetric::Counter(c) => *c.lock().unwrap(),
+                StressMetric::Counter(c) => c.load(Ordering::Relaxed),
                 _ => panic!("expected counter"),
             }
         }
@@ -295,7 +296,7 @@ pub mod stress {
         fn snapshot(&self) -> StressMetricSnapshot {
             match self {
                 StressMetric::Histogram(h) => StressMetricSnapshot::Histogram(h.lock().unwrap().clone()),
-                StressMetric::Counter(c) => StressMetricSnapshot::Counter(*c.lock().unwrap()),
+                StressMetric::Counter(c) => StressMetricSnapshot::Counter(c.load(Ordering::Relaxed)),
                 StressMetric::Gauge(g) => {
                     let g = g.lock().unwrap();
                     StressMetricSnapshot::Gauge {
@@ -313,27 +314,30 @@ pub mod stress {
         fn describe_histogram(&self, _k: KeyName, _u: Option<Unit>, _d: SharedString) {}
 
         fn register_counter(&self, key: &Key, _m: &Metadata<'_>) -> Counter {
-            let mut metrics = self.metrics.lock().unwrap();
-            let metric = metrics
+            let metric = self
+                .metrics
                 .entry(key.clone())
-                .or_insert_with(|| Arc::new(StressMetric::Counter(Mutex::new(0))));
-            Counter::from_arc(metric.clone())
+                .or_insert_with(|| Arc::new(StressMetric::Counter(AtomicU64::new(0))))
+                .clone();
+            Counter::from_arc(metric)
         }
 
         fn register_gauge(&self, key: &Key, _m: &Metadata<'_>) -> Gauge {
-            let mut metrics = self.metrics.lock().unwrap();
-            let metric = metrics
+            let metric = self
+                .metrics
                 .entry(key.clone())
-                .or_insert_with(|| Arc::new(StressMetric::Gauge(Mutex::new(GaugeState::default()))));
-            Gauge::from_arc(metric.clone())
+                .or_insert_with(|| Arc::new(StressMetric::Gauge(Mutex::new(GaugeState::default()))))
+                .clone();
+            Gauge::from_arc(metric)
         }
 
         fn register_histogram(&self, key: &Key, _m: &Metadata<'_>) -> Histogram {
-            let mut metrics = self.metrics.lock().unwrap();
-            let metric = metrics
+            let metric = self
+                .metrics
                 .entry(key.clone())
-                .or_insert_with(|| Arc::new(StressMetric::Histogram(Mutex::new(new_hdr()))));
-            Histogram::from_arc(metric.clone())
+                .or_insert_with(|| Arc::new(StressMetric::Histogram(Mutex::new(new_hdr()))))
+                .clone();
+            Histogram::from_arc(metric)
         }
     }
 
@@ -342,13 +346,13 @@ pub mod stress {
             let StressMetric::Counter(c) = self else {
                 panic!("expected counter");
             };
-            *c.lock().unwrap() += value;
+            c.fetch_add(value, Ordering::Relaxed);
         }
         fn absolute(&self, value: u64) {
             let StressMetric::Counter(c) = self else {
                 panic!("expected counter");
             };
-            *c.lock().unwrap() = value;
+            c.store(value, Ordering::Relaxed);
         }
     }
 
@@ -383,19 +387,8 @@ pub mod stress {
     }
 
     /// Record a gauge's post-mutation value into its history histogram.
-    ///
-    /// The history is an HDR histogram of `u64`, so we clamp to `[0, hist.high()]` and cast.
-    /// A gauge that goes negative is clamped to 0 in the history (uncommon for the metrics
-    /// stress tests observe, but noted).
     fn record_gauge_sample(history: &mut HdrHistogram<u64>, value: f64) {
-        let high = history.high() as f64;
-        let clamped = if value.is_nan() || value < 0.0 {
-            0
-        } else if value > high {
-            history.high()
-        } else {
-            value as u64
-        };
+        let clamped = clamp_f64_to_u64(value, history.high());
         history.record(clamped).ok();
     }
 
@@ -405,14 +398,7 @@ pub mod stress {
                 panic!("expected histogram");
             };
             let mut h = h.lock().unwrap();
-            let high = h.high() as f64;
-            let clamped = if value.is_nan() || value < 0.0 {
-                0
-            } else if value > high {
-                h.high()
-            } else {
-                value as u64
-            };
+            let clamped = clamp_f64_to_u64(value, h.high());
             // Cannot fail: `clamped` is within [0, high()].
             h.record(clamped).ok();
         }
