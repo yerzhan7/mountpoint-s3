@@ -91,4 +91,4 @@ jobs:
             --run-ignored only \
             --success-output final \
             --failure-output final \
-            'stress_tests::${{ matrix.scenario }}'
+            'stress_tests::scenarios::${{ matrix.scenario }}'

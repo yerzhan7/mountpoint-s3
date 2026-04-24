@@ -108,7 +108,7 @@ export S3_BUCKET_NAME=your-bench-bucket STRESS_DURATION_SECS=15
 
 cargo test --release \
     --package mountpoint-s3-fs --test mod --features stress_tests \
-    stress_tests::smoke::smoke -- --ignored --nocapture --test-threads=1
+    stress_tests::scenarios::smoke::smoke -- --ignored --nocapture --test-threads=1
 ```
 
 A single scenario via nextest:
@@ -117,7 +117,7 @@ A single scenario via nextest:
 cargo nextest run \
     --features stress_tests \
     --package mountpoint-s3-fs \
-    stress_tests::sustained_reads \
+    stress_tests::scenarios::sustained_reads \
     --run-ignored only \
     --success-output final --failure-output final
 ```
@@ -194,7 +194,7 @@ At teardown the harness prints (via `tracing::info!`):
 
 ## Adding a new scenario
 
-1. Create `tests/stress_tests/my_scenario.rs`.
+1. Create `tests/stress_tests/scenarios/my_scenario.rs`.
 2. Implement `crate::stress_tests::harness::Scenario`: at minimum `name`,
    `num_workers`, `session_config`, and `run_worker`. Override
    `max_idle_duration`, `max_latency` (takes a `FileOp`), `s3_path_override`,
@@ -231,7 +231,7 @@ At teardown the harness prints (via `tracing::info!`):
    upload-if-missing from `setup()`.
 5. Add a `#[test] #[ignore = "stress test; run with --run-ignored only"]`
    entry point that calls `harness::run(MyScenario)`.
-6. Register the module in `tests/stress_tests/mod.rs`.
+6. Register the module in `tests/stress_tests/scenarios/mod.rs`.
 7. `cargo check --features stress_tests --tests` — it should compile.
 8. Run it locally at a short duration
    (`STRESS_DURATION_SECS=30 cargo test --release ...`) before proposing for
