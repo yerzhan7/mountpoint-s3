@@ -14,7 +14,7 @@ use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 use mountpoint_s3_fs::s3::S3Path;
 
 use crate::common::fuse::{TestSession, TestSessionConfig};
-use crate::stress_tests::harness::{self, Op, Scenario, WorkerRecorder};
+use crate::stress_tests::harness::{self, Op, Scenario, OpLatencies};
 use crate::stress_tests::test_objects::{self, SMALL_SET_COUNT, SMALL_SET_SIZE, small_object_key};
 
 const NUM_SHORT_WORKERS: usize = 48;
@@ -49,13 +49,13 @@ impl Scenario for Churn {
         worker_id: usize,
         mount_path: &Path,
         progress: &AtomicU64,
-        recorder: &mut WorkerRecorder,
+        latencies: &mut OpLatencies,
         stop: &AtomicBool,
     ) {
         if worker_id < NUM_SHORT_WORKERS {
-            short_loop(worker_id, mount_path, progress, recorder, stop);
+            short_loop(worker_id, mount_path, progress, latencies, stop);
         } else {
-            idle_loop(worker_id - NUM_SHORT_WORKERS, mount_path, progress, recorder, stop);
+            idle_loop(worker_id - NUM_SHORT_WORKERS, mount_path, progress, latencies, stop);
         }
     }
 }
@@ -64,7 +64,7 @@ fn short_loop(
     worker_id: usize,
     mount_path: &Path,
     progress: &AtomicU64,
-    recorder: &mut WorkerRecorder,
+    latencies: &mut OpLatencies,
     stop: &AtomicBool,
 ) {
     let mut buf = vec![0u8; SMALL_SET_SIZE];
@@ -74,7 +74,7 @@ fn short_loop(
         // Deterministic pseudo-random pick across the shared small-object set.
         let idx = (iter.wrapping_mul(2_654_435_761).wrapping_add(worker_id as u64) as usize) % SMALL_SET_COUNT;
         let path = mount_path.join(small_object_key(idx));
-        let mut file = recorder
+        let mut file = latencies
             .time(Op::Open, || File::open(&path))
             .unwrap_or_else(|e| {
                 panic!("churn: worker {worker_id}: open of {path:?} failed: {e:?}");
@@ -82,7 +82,7 @@ fn short_loop(
         progress.fetch_add(1, Ordering::Relaxed);
         let mut read = 0usize;
         while read < SMALL_SET_SIZE && !stop.load(Ordering::Relaxed) {
-            let n = recorder
+            let n = latencies
                 .time(Op::Read, || file.read(&mut buf[read..]))
                 .unwrap_or_else(|e| {
                     panic!("churn: worker {worker_id}: read of {path:?} failed: {e:?}");
@@ -93,7 +93,7 @@ fn short_loop(
             read += n;
             progress.fetch_add(n as u64, Ordering::Relaxed);
         }
-        recorder.time(Op::Close, || drop(file));
+        latencies.time(Op::Close, || drop(file));
     }
 }
 
@@ -104,7 +104,7 @@ fn idle_loop(
     worker_id: usize,
     mount_path: &Path,
     progress: &AtomicU64,
-    recorder: &mut WorkerRecorder,
+    latencies: &mut OpLatencies,
     stop: &AtomicBool,
 ) {
     let mut buf = vec![0u8; IDLE_READ_BYTES];
@@ -113,7 +113,7 @@ fn idle_loop(
         iter += 1;
         let idx = (iter.wrapping_mul(2_246_822_519).wrapping_add(worker_id as u64) as usize) % SMALL_SET_COUNT;
         let path = mount_path.join(small_object_key(idx));
-        let mut file = recorder
+        let mut file = latencies
             .time(Op::Open, || File::open(&path))
             .unwrap_or_else(|e| {
                 panic!("churn: idle worker {worker_id}: open of {path:?} failed: {e:?}");
@@ -124,7 +124,7 @@ fn idle_loop(
         // handle then becomes a valid pruning candidate while it sits idle below.
         let mut read = 0usize;
         while read < IDLE_READ_BYTES.min(SMALL_SET_SIZE) && !stop.load(Ordering::Relaxed) {
-            let n = recorder
+            let n = latencies
                 .time(Op::Read, || file.read(&mut buf[read..]))
                 .unwrap_or_else(|e| {
                     panic!("churn: idle worker {worker_id}: read of {path:?} failed: {e:?}");
@@ -141,7 +141,7 @@ fn idle_loop(
         while Instant::now() < idle_deadline && !stop.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(500));
         }
-        recorder.time(Op::Close, || drop(file));
+        latencies.time(Op::Close, || drop(file));
         progress.fetch_add(1, Ordering::Relaxed);
     }
 }

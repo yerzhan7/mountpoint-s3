@@ -7,7 +7,7 @@ use metrics::{
 use std::sync::{Arc, Mutex};
 
 /// Return `Some(Arc<M>)` for the unique entry in `map` whose name is `name` and whose label
-/// set exactly matches `labels`. Shared by `TestRecorder` and `StressTestRecorder`.
+/// set exactly matches `labels`. Shared by `TestRecorder` and `HdrRecorder`.
 fn lookup<M>(map: &DashMap<Key, Arc<M>>, name: &str, labels: &[(&str, &str)]) -> Option<Arc<M>> {
     map.iter()
         .find(|entry| {
@@ -175,7 +175,7 @@ impl HistogramFn for Metric {
 /// HDR-backed recorder used by stress tests. Histograms use `hdrhistogram` for bounded-memory
 /// percentile storage; counters are lock-free `AtomicU64` (matching prod); gauges keep both a
 /// current value and a full HDR history so assertions can read the true peak without sampling
-/// races (no prod analogue — see `StressMetric::Gauge`).
+/// races (no prod analogue — see `HdrMetric::Gauge`).
 #[cfg(feature = "stress_tests")]
 pub mod stress {
     use super::*;
@@ -190,9 +190,10 @@ pub mod stress {
         HdrHistogram::<u64>::new_with_bounds(1, HDR_HIGH, 3).expect("HDR bounds valid")
     }
 
-    /// Clamp an `f64` into `[0, high]` as `u64`. NaN and negatives become 0; values above
-    /// `high` become `high`. Used by both gauge-history recording and histogram sampling.
-    fn clamp_f64_to_u64(value: f64, high: u64) -> u64 {
+    /// Clamp an `f64` into `[0, hist.high()]` as `u64`. NaN and negatives become 0; values
+    /// above the histogram's upper bound are clamped down so recording can never fail.
+    fn clamp(value: f64, hist: &HdrHistogram<u64>) -> u64 {
+        let high = hist.high();
         if value.is_nan() || value < 0.0 {
             0
         } else if value > high as f64 {
@@ -203,26 +204,25 @@ pub mod stress {
     }
 
     #[derive(Debug, Default, Clone)]
-    pub struct StressTestRecorder {
-        metrics: Arc<DashMap<Key, Arc<StressMetric>>>,
+    pub struct HdrRecorder {
+        metrics: Arc<DashMap<Key, Arc<HdrMetric>>>,
     }
 
-    impl StressTestRecorder {
-        pub fn get(&self, name: &str, labels: &[(&str, &str)]) -> Option<Arc<StressMetric>> {
+    impl HdrRecorder {
+        pub fn get(&self, name: &str, labels: &[(&str, &str)]) -> Option<Arc<HdrMetric>> {
             lookup(&self.metrics, name, labels)
         }
 
-        /// Clone out the current state of every registered metric. Per-metric state is
-        /// cloned through the `DashMap` iterator without holding a global lock.
-        pub fn snapshot_all(&self) -> Vec<(Key, StressMetricSnapshot)> {
-            self.metrics
-                .iter()
-                .map(|entry| (entry.key().clone(), entry.value().snapshot()))
-                .collect()
+        /// Call `f` for every registered metric. Holds a read-side `DashMap` reference per
+        /// entry — callers must not re-enter the recorder from `f`.
+        pub fn for_each(&self, mut f: impl FnMut(&Key, &HdrMetric)) {
+            for entry in self.metrics.iter() {
+                f(entry.key(), entry.value());
+            }
         }
     }
 
-    /// State behind a [`StressMetric::Gauge`]. Holds both the latest point-in-time value and
+    /// State behind a [`HdrMetric::Gauge`]. Holds both the latest point-in-time value and
     /// a history of every value the gauge has taken on since installation. The history lets
     /// tests assert true peak/percentiles of the gauge without sampling races; the current
     /// value is still needed for teardown invariants ("did everything get released?").
@@ -242,30 +242,16 @@ pub mod stress {
     }
 
     #[derive(Debug)]
-    pub enum StressMetric {
+    pub enum HdrMetric {
         Histogram(Mutex<HdrHistogram<u64>>),
         Counter(AtomicU64),
         Gauge(Mutex<GaugeState>),
     }
 
-    impl Default for StressMetric {
-        fn default() -> Self {
-            StressMetric::Histogram(Mutex::new(new_hdr()))
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    pub enum StressMetricSnapshot {
-        Histogram(HdrHistogram<u64>),
-        Counter(u64),
-        /// `(current_value, history_of_every_value_seen)`.
-        Gauge { current: f64, history: HdrHistogram<u64> },
-    }
-
-    impl StressMetric {
+    impl HdrMetric {
         pub fn gauge(&self) -> f64 {
             match self {
-                StressMetric::Gauge(g) => g.lock().unwrap().current,
+                HdrMetric::Gauge(g) => g.lock().unwrap().current,
                 _ => panic!("expected gauge"),
             }
         }
@@ -274,41 +260,27 @@ pub mod stress {
         /// Use `.max()` on the returned histogram to get the true peak without sampling races.
         pub fn gauge_history(&self) -> HdrHistogram<u64> {
             match self {
-                StressMetric::Gauge(g) => g.lock().unwrap().history.clone(),
+                HdrMetric::Gauge(g) => g.lock().unwrap().history.clone(),
                 _ => panic!("expected gauge"),
             }
         }
 
         pub fn counter(&self) -> u64 {
             match self {
-                StressMetric::Counter(c) => c.load(Ordering::Relaxed),
+                HdrMetric::Counter(c) => c.load(Ordering::Relaxed),
                 _ => panic!("expected counter"),
             }
         }
 
         pub fn histogram_clone(&self) -> HdrHistogram<u64> {
             match self {
-                StressMetric::Histogram(h) => h.lock().unwrap().clone(),
+                HdrMetric::Histogram(h) => h.lock().unwrap().clone(),
                 _ => panic!("expected histogram"),
-            }
-        }
-
-        fn snapshot(&self) -> StressMetricSnapshot {
-            match self {
-                StressMetric::Histogram(h) => StressMetricSnapshot::Histogram(h.lock().unwrap().clone()),
-                StressMetric::Counter(c) => StressMetricSnapshot::Counter(c.load(Ordering::Relaxed)),
-                StressMetric::Gauge(g) => {
-                    let g = g.lock().unwrap();
-                    StressMetricSnapshot::Gauge {
-                        current: g.current,
-                        history: g.history.clone(),
-                    }
-                }
             }
         }
     }
 
-    impl Recorder for StressTestRecorder {
+    impl Recorder for HdrRecorder {
         fn describe_counter(&self, _k: KeyName, _u: Option<Unit>, _d: SharedString) {}
         fn describe_gauge(&self, _k: KeyName, _u: Option<Unit>, _d: SharedString) {}
         fn describe_histogram(&self, _k: KeyName, _u: Option<Unit>, _d: SharedString) {}
@@ -317,7 +289,7 @@ pub mod stress {
             let metric = self
                 .metrics
                 .entry(key.clone())
-                .or_insert_with(|| Arc::new(StressMetric::Counter(AtomicU64::new(0))))
+                .or_insert_with(|| Arc::new(HdrMetric::Counter(AtomicU64::new(0))))
                 .clone();
             Counter::from_arc(metric)
         }
@@ -326,7 +298,7 @@ pub mod stress {
             let metric = self
                 .metrics
                 .entry(key.clone())
-                .or_insert_with(|| Arc::new(StressMetric::Gauge(Mutex::new(GaugeState::default()))))
+                .or_insert_with(|| Arc::new(HdrMetric::Gauge(Mutex::new(GaugeState::default()))))
                 .clone();
             Gauge::from_arc(metric)
         }
@@ -335,30 +307,30 @@ pub mod stress {
             let metric = self
                 .metrics
                 .entry(key.clone())
-                .or_insert_with(|| Arc::new(StressMetric::Histogram(Mutex::new(new_hdr()))))
+                .or_insert_with(|| Arc::new(HdrMetric::Histogram(Mutex::new(new_hdr()))))
                 .clone();
             Histogram::from_arc(metric)
         }
     }
 
-    impl CounterFn for StressMetric {
+    impl CounterFn for HdrMetric {
         fn increment(&self, value: u64) {
-            let StressMetric::Counter(c) = self else {
+            let HdrMetric::Counter(c) = self else {
                 panic!("expected counter");
             };
             c.fetch_add(value, Ordering::Relaxed);
         }
         fn absolute(&self, value: u64) {
-            let StressMetric::Counter(c) = self else {
+            let HdrMetric::Counter(c) = self else {
                 panic!("expected counter");
             };
             c.store(value, Ordering::Relaxed);
         }
     }
 
-    impl GaugeFn for StressMetric {
+    impl GaugeFn for HdrMetric {
         fn increment(&self, value: f64) {
-            let StressMetric::Gauge(g) = self else {
+            let HdrMetric::Gauge(g) = self else {
                 panic!("expected gauge");
             };
             let mut g = g.lock().unwrap();
@@ -367,7 +339,7 @@ pub mod stress {
             record_gauge_sample(&mut g.history, current);
         }
         fn decrement(&self, value: f64) {
-            let StressMetric::Gauge(g) = self else {
+            let HdrMetric::Gauge(g) = self else {
                 panic!("expected gauge");
             };
             let mut g = g.lock().unwrap();
@@ -376,7 +348,7 @@ pub mod stress {
             record_gauge_sample(&mut g.history, current);
         }
         fn set(&self, value: f64) {
-            let StressMetric::Gauge(g) = self else {
+            let HdrMetric::Gauge(g) = self else {
                 panic!("expected gauge");
             };
             let mut g = g.lock().unwrap();
@@ -388,17 +360,17 @@ pub mod stress {
 
     /// Record a gauge's post-mutation value into its history histogram.
     fn record_gauge_sample(history: &mut HdrHistogram<u64>, value: f64) {
-        let clamped = clamp_f64_to_u64(value, history.high());
+        let clamped = clamp(value, history);
         history.record(clamped).ok();
     }
 
-    impl HistogramFn for StressMetric {
+    impl HistogramFn for HdrMetric {
         fn record(&self, value: f64) {
-            let StressMetric::Histogram(h) = self else {
+            let HdrMetric::Histogram(h) = self else {
                 panic!("expected histogram");
             };
             let mut h = h.lock().unwrap();
-            let clamped = clamp_f64_to_u64(value, h.high());
+            let clamped = clamp(value, &h);
             // Cannot fail: `clamped` is within [0, high()].
             h.record(clamped).ok();
         }
@@ -415,7 +387,7 @@ pub mod stress {
 
         #[test]
         fn histogram_roundtrips_percentiles() {
-            let rec = StressTestRecorder::default();
+            let rec = HdrRecorder::default();
             let key = Key::from_name("h");
             let h = rec.register_histogram(&key, &meta());
             for v in 1..=1000 {
@@ -432,7 +404,7 @@ pub mod stress {
 
         #[test]
         fn histogram_clamps_out_of_range() {
-            let rec = StressTestRecorder::default();
+            let rec = HdrRecorder::default();
             let key = Key::from_name("h");
             let h = rec.register_histogram(&key, &meta());
             // None of these should panic; all should be recorded (clamped internally).
@@ -446,7 +418,7 @@ pub mod stress {
 
         #[test]
         fn counter_and_gauge_behave() {
-            let rec = StressTestRecorder::default();
+            let rec = HdrRecorder::default();
             let c = rec.register_counter(&Key::from_name("c"), &meta());
             let g = rec.register_gauge(&Key::from_name("g"), &meta());
             c.increment(5);
@@ -458,7 +430,7 @@ pub mod stress {
 
         #[test]
         fn gauge_history_tracks_peak_and_current() {
-            let rec = StressTestRecorder::default();
+            let rec = HdrRecorder::default();
             let g = rec.register_gauge(&Key::from_name("mem.bytes_reserved"), &meta());
             // Simulate reserve-spike-release: peak at 1000, then back to 0.
             g.increment(100.0);

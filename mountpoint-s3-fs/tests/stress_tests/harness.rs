@@ -19,7 +19,7 @@ use mountpoint_s3_fs::s3::S3Path;
 
 use crate::common::fuse::{self, TestSession, TestSessionConfig};
 use crate::common::stress_recorder;
-use crate::common::test_recorder::stress::{StressMetricSnapshot, StressTestRecorder};
+use crate::common::test_recorder::stress::{HdrMetric, HdrRecorder};
 
 use hdrhistogram::Histogram as HdrHistogram;
 
@@ -65,14 +65,14 @@ pub trait Scenario: Send + Sync {
     fn setup(&self, _session: &TestSession) {}
 
     /// Worker body. Must loop until `stop` is set, incrementing `progress` to signal liveness.
-    /// Time file ops via `recorder.time(op, || ...)` so the harness can aggregate per-op
+    /// Time file ops via `latencies.time(op, || ...)` so the harness can aggregate per-op
     /// latency histograms and assert a p100 ceiling at teardown.
     fn run_worker(
         &self,
         worker_id: usize,
         mount_path: &Path,
         progress: &AtomicU64,
-        recorder: &mut WorkerRecorder,
+        latencies: &mut OpLatencies,
         stop: &AtomicBool,
     );
 
@@ -88,7 +88,7 @@ pub trait Scenario: Send + Sync {
     }
 }
 
-/// File operations timed by [`WorkerRecorder`].
+/// File operations timed by [`OpLatencies`].
 #[derive(Clone, Copy, Debug)]
 pub enum Op {
     Open = 0,
@@ -110,12 +110,12 @@ impl Op {
     }
 }
 
-/// Per-worker latency recorder. Each worker owns one; the harness merges them at teardown.
-pub struct WorkerRecorder {
+/// Per-worker op-latency histograms. Each worker owns one; the harness merges them at teardown.
+pub struct OpLatencies {
     histograms: [HdrHistogram<u64>; 4],
 }
 
-impl WorkerRecorder {
+impl OpLatencies {
     pub fn new() -> Self {
         let mk = || HdrHistogram::<u64>::new_with_bounds(1, 600_000_000, 3).expect("HDR bounds valid");
         Self {
@@ -139,7 +139,7 @@ impl WorkerRecorder {
         &self.histograms[op as usize]
     }
 
-    pub fn merge(&mut self, other: &WorkerRecorder) {
+    pub fn merge(&mut self, other: &OpLatencies) {
         for op in Op::ALL {
             // Safe: both histograms share the same bounds.
             let _ = self.histograms[op as usize].add(&other.histograms[op as usize]);
@@ -147,7 +147,7 @@ impl WorkerRecorder {
     }
 }
 
-impl Default for WorkerRecorder {
+impl Default for OpLatencies {
     fn default() -> Self {
         Self::new()
     }
@@ -195,16 +195,16 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
     let max_idles: Vec<Duration> = (0..num_workers).map(|i| scenario.max_idle_duration(i)).collect();
 
     let mount_path: std::path::PathBuf = session.mount_path().to_path_buf();
-    let mut handles: Vec<thread::JoinHandle<WorkerRecorder>> = Vec::with_capacity(num_workers);
+    let mut handles: Vec<thread::JoinHandle<OpLatencies>> = Vec::with_capacity(num_workers);
     for worker_id in 0..num_workers {
         let scenario = scenario.clone();
         let stop = stop.clone();
         let progress = progress[worker_id].clone();
         let mount_path = mount_path.clone();
         handles.push(thread::spawn(move || {
-            let mut recorder = WorkerRecorder::new();
-            scenario.run_worker(worker_id, &mount_path, &progress, &mut recorder, &stop);
-            recorder
+            let mut latencies = OpLatencies::new();
+            scenario.run_worker(worker_id, &mount_path, &progress, &mut latencies, &stop);
+            latencies
         }));
     }
 
@@ -229,7 +229,7 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
     }
 
     let join_deadline = Instant::now() + JOIN_TIMEOUT;
-    let mut aggregate = WorkerRecorder::new();
+    let mut aggregate = OpLatencies::new();
     for (id, handle) in handles.into_iter().enumerate() {
         if Instant::now() >= join_deadline {
             panic!("worker {id} did not finish within {JOIN_TIMEOUT:?} after stop");
@@ -409,7 +409,7 @@ fn assert_teardown_invariants(scenario_name: &str) {
 }
 
 /// Return `(area_label, gauge_value)` pairs for each `mem.bytes_reserved{area=...}` we know about.
-fn read_mem_bytes_reserved(recorder: &StressTestRecorder) -> Vec<(&'static str, f64)> {
+fn read_mem_bytes_reserved(recorder: &HdrRecorder) -> Vec<(&'static str, f64)> {
     ["upload", "prefetch"]
         .into_iter()
         .filter_map(|area| {
@@ -430,8 +430,8 @@ fn format_mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
-/// Print a per-op worker latency table followed by the global StressTestRecorder snapshot.
-fn dump_summary(scenario_name: &str, aggregate: &WorkerRecorder) {
+/// Print a per-op worker latency table followed by the global HdrRecorder snapshot.
+fn dump_summary(scenario_name: &str, aggregate: &OpLatencies) {
     tracing::info!("=== stress [{scenario_name}] worker op latencies ===");
     for op in Op::ALL {
         let h = aggregate.histogram(op);
@@ -456,46 +456,54 @@ fn dump_summary(scenario_name: &str, aggregate: &WorkerRecorder) {
         tracing::info!("(no global recorder installed)");
         return;
     };
-    let mut snapshot = recorder.snapshot_all();
-    snapshot.sort_by(|a, b| format!("{}", a.0).cmp(&format!("{}", b.0)));
-    for (key, metric) in snapshot {
-        match metric {
-            StressMetricSnapshot::Histogram(h) => {
+    let mut lines: Vec<(String, String)> = Vec::new();
+    recorder.for_each(|key, metric| {
+        let key_str = format!("{key}");
+        let line = match metric {
+            HdrMetric::Histogram(_) => {
+                let h = metric.histogram_clone();
                 let count = h.len();
                 if count == 0 {
-                    tracing::info!("hist {key}: count=0");
+                    format!("hist {key}: count=0")
                 } else {
                     // Raw HDR values: unit varies per metric (bytes, µs, MiB, count, etc.) —
                     // the caller interprets from the metric name. Formatting a single unit
                     // here would be wrong for anything that isn't latency.
-                    tracing::info!(
+                    format!(
                         "hist {key}: count={} p50={} p90={} p99={} p100={}",
                         count,
                         h.value_at_quantile(0.50),
                         h.value_at_quantile(0.90),
                         h.value_at_quantile(0.99),
                         h.max(),
-                    );
+                    )
                 }
             }
-            StressMetricSnapshot::Counter(c) => tracing::info!("counter {key}: {c}"),
-            StressMetricSnapshot::Gauge { current, history } => {
-                let peak = history.max();
-                tracing::info!(
-                    "gauge {key}: current={current} peak={peak} samples={} (p50={} p90={} p99={})",
+            HdrMetric::Counter(_) => format!("counter {key}: {}", metric.counter()),
+            HdrMetric::Gauge(_) => {
+                let current = metric.gauge();
+                let history = metric.gauge_history();
+                format!(
+                    "gauge {key}: current={current} peak={} samples={} (p50={} p90={} p99={})",
+                    history.max(),
                     history.len(),
                     history.value_at_quantile(0.50),
                     history.value_at_quantile(0.90),
                     history.value_at_quantile(0.99),
-                );
+                )
             }
-        }
+        };
+        lines.push((key_str, line));
+    });
+    lines.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, line) in lines {
+        tracing::info!("{}", line);
     }
 }
 
 /// Assert that the merged per-op p100 latency is within `max_latency`. Ops with zero samples
 /// are skipped (e.g. read-only scenarios never record a write sample).
-fn assert_p100_latency(scenario_name: &str, aggregate: &WorkerRecorder, max_latency: Duration) {
+fn assert_p100_latency(scenario_name: &str, aggregate: &OpLatencies, max_latency: Duration) {
     let max_us = max_latency.as_micros().min(u64::MAX as u128) as u64;
     let mut violations: Vec<String> = Vec::new();
     for op in Op::ALL {
@@ -532,13 +540,13 @@ mod tests {
     }
 
     #[test]
-    fn worker_recorder_time_and_merge() {
-        let mut a = WorkerRecorder::new();
+    fn op_latencies_time_and_merge() {
+        let mut a = OpLatencies::new();
         let r = a.time(Op::Open, || 42);
         assert_eq!(r, 42);
         assert_eq!(a.histogram(Op::Open).len(), 1);
         a.time(Op::Read, || ());
-        let mut b = WorkerRecorder::new();
+        let mut b = OpLatencies::new();
         b.time(Op::Open, || ());
         a.merge(&b);
         assert_eq!(a.histogram(Op::Open).len(), 2);
@@ -548,7 +556,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "violated p100 latency ceiling")]
     fn assert_p100_latency_flags_outlier() {
-        let mut agg = WorkerRecorder::new();
+        let mut agg = OpLatencies::new();
         // Record a 6s read sample (in µs).
         agg.histograms[Op::Read as usize].record(6_000_000).unwrap();
         assert_p100_latency("test", &agg, Duration::from_secs(5));
@@ -556,7 +564,7 @@ mod tests {
 
     #[test]
     fn assert_p100_latency_skips_empty_ops() {
-        let agg = WorkerRecorder::new();
+        let agg = OpLatencies::new();
         assert_p100_latency("test", &agg, Duration::from_secs(5));
     }
 

@@ -11,7 +11,7 @@ use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 use mountpoint_s3_fs::s3::S3Path;
 
 use crate::common::fuse::{TestSession, TestSessionConfig};
-use crate::stress_tests::harness::{self, Op, Scenario, WorkerRecorder};
+use crate::stress_tests::harness::{self, Op, Scenario, OpLatencies};
 use crate::stress_tests::test_objects::{self, READ_OBJECT_KEY};
 
 const READ_CHUNK: usize = 8 * 1024 * 1024; // 8 MiB — matches default part size
@@ -45,13 +45,13 @@ impl Scenario for SustainedReads {
         _worker_id: usize,
         mount_path: &Path,
         progress: &AtomicU64,
-        recorder: &mut WorkerRecorder,
+        latencies: &mut OpLatencies,
         stop: &AtomicBool,
     ) {
         let path = mount_path.join(READ_OBJECT_KEY);
         let mut buf = vec![0u8; READ_CHUNK];
         while !stop.load(Ordering::Relaxed) {
-            let mut file = recorder
+            let mut file = latencies
                 .time(Op::Open, || File::open(&path))
                 .unwrap_or_else(|e| {
                     panic!("sustained_reads: open of {path:?} failed: {e:?}");
@@ -62,7 +62,7 @@ impl Scenario for SustainedReads {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
-                let n = recorder
+                let n = latencies
                     .time(Op::Read, || file.read(&mut buf))
                     .unwrap_or_else(|e| {
                         panic!("sustained_reads: read of {path:?} failed: {e:?}");
@@ -72,7 +72,7 @@ impl Scenario for SustainedReads {
                 }
                 progress.fetch_add(n as u64, Ordering::Relaxed);
             }
-            recorder.time(Op::Close, || drop(file));
+            latencies.time(Op::Close, || drop(file));
         }
     }
 }

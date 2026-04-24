@@ -164,7 +164,7 @@ All scenarios set `mem_limit = MINIMUM_MEM_LIMIT` (512 MiB) via
 At teardown the harness prints (via `tracing::info!`):
 
 1. A **worker op latency table** built from merged per-worker
-   `WorkerRecorder` HDR histograms — one line per op with count and
+   `OpLatencies` HDR histograms — one line per op with count and
    p50/p90/p99/p100 in ms, e.g.
 
    ```
@@ -175,7 +175,7 @@ At teardown the harness prints (via `tracing::info!`):
    op=close count=64 p50=0.4ms p90=17.7ms p99=30.0ms p100=30.0ms
    ```
 
-2. A **global metrics snapshot** from the `StressTestRecorder` (HDR-backed
+2. A **global metrics snapshot** from the `HdrRecorder` (HDR-backed
    replacement for `TestRecorder` that ingests every `metrics::` emission
    from production code during the run). Histograms are printed as raw HDR
    values (unit varies per metric — bytes / µs / MiB / count — infer from
@@ -197,22 +197,22 @@ At teardown the harness prints (via `tracing::info!`):
        worker_id: usize,
        mount_path: &Path,
        progress: &AtomicU64,
-       recorder: &mut WorkerRecorder,
+       latencies: &mut OpLatencies,
        stop: &AtomicBool,
    );
    ```
 
-   Wrap every file-system operation in `recorder.time(Op::_, || ...)` so
+   Wrap every file-system operation in `latencies.time(Op::_, || ...)` so
    the harness can aggregate per-op latency distributions. For example:
 
    ```rust
-   let mut file = recorder
+   let mut file = latencies
        .time(Op::Open, || File::open(&path))
        .unwrap_or_else(|e| panic!("open failed: {e:?}"));
-   let n = recorder
+   let n = latencies
        .time(Op::Read, || file.read(&mut buf))
        .unwrap_or_else(|e| panic!("read failed: {e:?}"));
-   recorder.time(Op::Close, || drop(file));
+   latencies.time(Op::Close, || drop(file));
    ```
 
 4. If the scenario needs a shared test object, add a helper in
@@ -236,7 +236,7 @@ Worker bodies should:
   shows up as liveness.
 - Readers / open-read-close loops: bump progress on every successful open in
   addition to the bytes read.
-- Time every op via `recorder.time(Op::_, || ...)`. The `p100` assertion is
+- Time every op via `latencies.time(Op::_, || ...)`. The `p100` assertion is
   aggregated across workers per op.
 - Check `stop.load(Ordering::Relaxed)` frequently and return when set.
 - **Not** tolerate errors from `File::open`/`File::create`/`read`/`write`.

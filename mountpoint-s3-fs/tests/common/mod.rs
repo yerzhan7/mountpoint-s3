@@ -160,21 +160,21 @@ fn init_crt() {
 
 #[cfg(feature = "stress_tests")]
 pub mod stress_recorder {
-    use super::test_recorder::stress::StressTestRecorder;
+    use super::test_recorder::stress::HdrRecorder;
     use std::sync::OnceLock;
 
-    static RECORDER: OnceLock<StressTestRecorder> = OnceLock::new();
+    static RECORDER: OnceLock<HdrRecorder> = OnceLock::new();
 
     pub fn install() {
         RECORDER.get_or_init(|| {
-            let recorder = StressTestRecorder::default();
+            let recorder = HdrRecorder::default();
             // Ignore errors: another test binary or ctor may have installed a recorder already.
             let _ = metrics::set_global_recorder(recorder.clone());
             recorder
         });
     }
 
-    pub fn recorder() -> Option<&'static StressTestRecorder> {
+    pub fn recorder() -> Option<&'static HdrRecorder> {
         RECORDER.get()
     }
 }

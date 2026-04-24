@@ -14,7 +14,7 @@ use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 use mountpoint_s3_fs::s3::S3Path;
 
 use crate::common::fuse::{TestSession, TestSessionConfig};
-use crate::stress_tests::harness::{self, Op, Scenario, WorkerRecorder};
+use crate::stress_tests::harness::{self, Op, Scenario, OpLatencies};
 use crate::stress_tests::test_objects::{self, READ_OBJECT_KEY};
 const NUM_READERS: usize = 16;
 const NUM_WRITERS: usize = 24;
@@ -53,13 +53,13 @@ impl Scenario for MixedRw {
         worker_id: usize,
         mount_path: &Path,
         progress: &AtomicU64,
-        recorder: &mut WorkerRecorder,
+        latencies: &mut OpLatencies,
         stop: &AtomicBool,
     ) {
         if worker_id < NUM_READERS {
-            reader_loop(worker_id, mount_path, progress, recorder, stop);
+            reader_loop(worker_id, mount_path, progress, latencies, stop);
         } else {
-            writer_loop(worker_id - NUM_READERS, mount_path, progress, recorder, stop);
+            writer_loop(worker_id - NUM_READERS, mount_path, progress, latencies, stop);
         }
     }
 }
@@ -68,13 +68,13 @@ fn reader_loop(
     reader_id: usize,
     mount_path: &Path,
     progress: &AtomicU64,
-    recorder: &mut WorkerRecorder,
+    latencies: &mut OpLatencies,
     stop: &AtomicBool,
 ) {
     let path = mount_path.join(READ_OBJECT_KEY);
     let mut buf = vec![0u8; READ_CHUNK];
     while !stop.load(Ordering::Relaxed) {
-        let mut file = recorder
+        let mut file = latencies
             .time(Op::Open, || File::open(&path))
             .unwrap_or_else(|e| {
                 panic!("mixed_rw: reader {reader_id}: open of {path:?} failed: {e:?}");
@@ -85,7 +85,7 @@ fn reader_loop(
             if stop.load(Ordering::Relaxed) {
                 return;
             }
-            let n = recorder
+            let n = latencies
                 .time(Op::Read, || file.read(&mut buf))
                 .unwrap_or_else(|e| {
                     panic!("mixed_rw: reader {reader_id}: read of {path:?} failed: {e:?}");
@@ -95,7 +95,7 @@ fn reader_loop(
             }
             progress.fetch_add(n as u64, Ordering::Relaxed);
         }
-        recorder.time(Op::Close, || drop(file));
+        latencies.time(Op::Close, || drop(file));
     }
 }
 
@@ -103,7 +103,7 @@ fn writer_loop(
     writer_id: usize,
     mount_path: &Path,
     progress: &AtomicU64,
-    recorder: &mut WorkerRecorder,
+    latencies: &mut OpLatencies,
     stop: &AtomicBool,
 ) {
     let chunk = vec![0xC3u8; WRITE_CHUNK];
@@ -119,7 +119,7 @@ fn writer_loop(
         );
         let path = mount_path.join(&key);
 
-        let mut file = recorder
+        let mut file = latencies
             .time(Op::Open, || File::create(&path))
             .unwrap_or_else(|e| {
                 panic!("mixed_rw: writer {writer_id}: create failed: {e:?}");
@@ -129,7 +129,7 @@ fn writer_loop(
         let mut written = 0usize;
         while written < WRITE_OBJECT_SIZE && !stop.load(Ordering::Relaxed) {
             let n = (WRITE_OBJECT_SIZE - written).min(WRITE_CHUNK);
-            recorder
+            latencies
                 .time(Op::Write, || file.write_all(&chunk[..n]))
                 .unwrap_or_else(|e| {
                     panic!("mixed_rw: writer {writer_id}: write failed: {e:?}");
@@ -137,7 +137,7 @@ fn writer_loop(
             written += n;
             progress.fetch_add(n as u64, Ordering::Relaxed);
         }
-        recorder.time(Op::Close, || drop(file));
+        latencies.time(Op::Close, || drop(file));
         progress.fetch_add(1, Ordering::Relaxed);
         let _ = std::fs::remove_file(&path);
     }

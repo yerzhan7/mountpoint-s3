@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 
 use crate::common::fuse::TestSessionConfig;
-use crate::stress_tests::harness::{self, Op, Scenario, WorkerRecorder};
+use crate::stress_tests::harness::{self, Op, Scenario, OpLatencies};
 
 const KEY: &str = "smoke.bin";
 const PAYLOAD_LEN: usize = 4096;
@@ -39,15 +39,15 @@ impl Scenario for SmokeScenario {
         _worker_id: usize,
         mount_path: &Path,
         progress: &AtomicU64,
-        recorder: &mut WorkerRecorder,
+        latencies: &mut OpLatencies,
         stop: &AtomicBool,
     ) {
         let path = mount_path.join(KEY);
         while !stop.load(Ordering::Relaxed) {
             let mut buf = Vec::with_capacity(PAYLOAD_LEN);
-            let mut f = recorder.time(Op::Open, || File::open(&path)).unwrap();
-            let n = recorder.time(Op::Read, || f.read_to_end(&mut buf)).unwrap();
-            recorder.time(Op::Close, || drop(f));
+            let mut f = latencies.time(Op::Open, || File::open(&path)).unwrap();
+            let n = latencies.time(Op::Read, || f.read_to_end(&mut buf)).unwrap();
+            latencies.time(Op::Close, || drop(f));
             progress.fetch_add(n as u64, Ordering::Relaxed);
         }
     }
