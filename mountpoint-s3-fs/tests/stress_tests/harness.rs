@@ -1,13 +1,6 @@
 //! Core harness for stress scenarios.
 //!
 //! Each scenario implements [`Scenario`]. Call [`run`] from a `#[test] #[ignore]` entry point.
-//!
-//! # Limitations (v1)
-//!
-//! - No cross-thread backtrace dumping on stall. If a worker stalls, the watchdog logs
-//!   per-worker progress counters but does not capture backtraces of other threads.
-//!   Use a debugger or core dumps if you need more diagnostic detail.
-//! - All scenarios run sequentially; `cargo nextest run ... --test-threads=1` is recommended.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -38,9 +31,8 @@ pub trait Scenario: Send + Sync {
     fn name(&self) -> &str;
 
     /// Maximum time worker `worker_id` may go without incrementing its progress counter
-    /// before the watchdog declares it stalled. The default is 30s for all workers (closes
-    /// of large write objects can legitimately take many seconds). The API still supports
-    /// per-worker thresholds for scenarios that need them.
+    /// before the watchdog declares it stalled. The default is 30s for all workers.
+    /// The API still supports per-worker thresholds for scenarios that need them.
     fn max_idle_duration(&self, _worker_id: usize) -> Duration {
         Duration::from_secs(30)
     }
@@ -168,8 +160,7 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
 
     let session = {
         let mut config = scenario.session_config();
-        // Enable delete + overwrite so scenarios can best-effort clean up their ephemeral
-        // objects through the mount without tripping mountpoint's default write-once semantics.
+        // Enable delete + overwrite so scenarios can best-effort clean up test objects
         config.filesystem_config.allow_delete = true;
         config.filesystem_config.allow_overwrite = true;
         match scenario.s3_path_override() {
@@ -221,9 +212,7 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
         thread::sleep(Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())));
     }
     stop.store(true, Ordering::SeqCst);
-    if let Some(wd) = watchdog {
-        let _ = wd.join();
-    }
+    let _ = watchdog.join();
 
     let mut aggregate = OpLatencies::new();
     for (id, handle) in handles.into_iter().enumerate() {
@@ -259,12 +248,8 @@ fn spawn_watchdog(
     progress: Vec<Arc<AtomicU64>>,
     stop: Arc<AtomicBool>,
     stalled_worker: Arc<AtomicUsize>,
-) -> Option<thread::JoinHandle<()>> {
-    if std::env::var("STRESS_WATCHDOG_DISABLE").is_ok() {
-        tracing::warn!(scenario = %scenario_name, "stress: watchdog disabled via STRESS_WATCHDOG_DISABLE");
-        return None;
-    }
-    Some(thread::spawn(move || {
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
         let start = Instant::now();
         let mut last_progress: Vec<u64> = progress.iter().map(|p| p.load(Ordering::Relaxed)).collect();
         let mut last_advance: Vec<Instant> = vec![start; progress.len()];
@@ -295,7 +280,7 @@ fn spawn_watchdog(
                 }
             }
         }
-    }))
+    })
 }
 
 fn read_duration_env() -> Duration {
