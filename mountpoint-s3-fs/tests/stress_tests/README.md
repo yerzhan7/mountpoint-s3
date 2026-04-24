@@ -60,7 +60,6 @@ Optional stress-specific variables:
 | Variable                       | Default | Purpose                                                                |
 |--------------------------------|---------|------------------------------------------------------------------------|
 | `STRESS_DURATION_SECS`         | 30      | Per-scenario duration in seconds                                       |
-| `STRESS_METRICS_INTERVAL_SECS` | 10      | How often the harness logs `mem.bytes_reserved` (debug output only — the peak invariant uses the gauge's own HDR history, not this sampler) |
 | `STRESS_WATCHDOG_DISABLE`      | unset   | If set to any value, disables the stall watchdog                       |
 
 ## Shared test objects

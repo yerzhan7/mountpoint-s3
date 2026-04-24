@@ -26,9 +26,6 @@ use hdrhistogram::Histogram as HdrHistogram;
 /// Default scenario duration if `STRESS_DURATION_SECS` is unset.
 const DEFAULT_DURATION_SECS: u64 = 30;
 
-/// Default metrics-logger interval if `STRESS_METRICS_INTERVAL_SECS` is unset.
-const DEFAULT_METRICS_INTERVAL_SECS: u64 = 10;
-
 /// How long to wait for worker threads to join after signalling stop.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -167,14 +164,12 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
     stress_recorder::install();
 
     let duration = read_duration_env();
-    let metrics_interval = read_metrics_interval_env();
     let scenario = Arc::new(scenario);
 
     tracing::info!(
         scenario = scenario.name(),
         duration_secs = duration.as_secs(),
         workers = scenario.num_workers(),
-        metrics_interval_secs = metrics_interval.as_secs(),
         "stress: starting"
     );
 
@@ -224,7 +219,6 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
         stop.clone(),
         stalled_worker.clone(),
     );
-    let metrics_logger = spawn_metrics_logger(scenario.name().to_string(), metrics_interval, stop.clone());
 
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
@@ -237,7 +231,6 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
     if let Some(wd) = watchdog {
         let _ = wd.join();
     }
-    let _ = metrics_logger.join();
 
     let join_deadline = Instant::now() + JOIN_TIMEOUT;
     let mut aggregate = WorkerRecorder::new();
@@ -249,15 +242,6 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
             .join()
             .unwrap_or_else(|e| panic!("worker {id} panicked: {e:?}"));
         aggregate.merge(&rec);
-    }
-
-    for (id, counter) in progress.iter().enumerate() {
-        tracing::info!(
-            scenario = scenario.name(),
-            worker = id,
-            progress = counter.load(Ordering::Relaxed),
-            "stress: final worker progress"
-        );
     }
 
     drop(session);
@@ -331,48 +315,6 @@ fn read_duration_env() -> Duration {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_DURATION_SECS);
     Duration::from_secs(secs)
-}
-
-fn read_metrics_interval_env() -> Duration {
-    let secs = std::env::var("STRESS_METRICS_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_METRICS_INTERVAL_SECS);
-    Duration::from_secs(secs)
-}
-
-fn spawn_metrics_logger(scenario_name: String, interval: Duration, stop: Arc<AtomicBool>) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        while !stop.load(Ordering::Relaxed) {
-            // Sleep in small slices so we notice stop promptly.
-            let mut remaining = interval;
-            let slice = Duration::from_millis(200);
-            while remaining > Duration::ZERO && !stop.load(Ordering::Relaxed) {
-                let s = slice.min(remaining);
-                thread::sleep(s);
-                remaining = remaining.saturating_sub(s);
-            }
-            log_mem_metrics(&scenario_name);
-        }
-    })
-}
-
-/// Log the current `mem.bytes_reserved` gauges (per area). Returns nothing — peak tracking
-/// is handled by the gauge's own history (see [`crate::common::test_recorder::stress`]).
-fn log_mem_metrics(scenario_name: &str) {
-    let Some(recorder) = stress_recorder::recorder() else {
-        return;
-    };
-    let per_area = read_mem_bytes_reserved(recorder);
-    for (area, value) in &per_area {
-        tracing::info!(
-            scenario = scenario_name,
-            metric = "mem.bytes_reserved",
-            area = *area,
-            value = *value,
-            "stress: metric",
-        );
-    }
 }
 
 /// Assert the true peak of `sum(mem.bytes_reserved)` over the whole run stayed at or below
