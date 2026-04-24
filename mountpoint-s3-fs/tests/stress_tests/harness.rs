@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use mountpoint_s3_fs::metrics::defs::PROCESS_MEMORY_USAGE;
 use mountpoint_s3_fs::s3::S3Path;
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, get_current_pid};
 
 use crate::common::fuse::{self, TestSession, TestSessionConfig};
 use crate::common::stress_recorder;
@@ -204,6 +206,8 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
         stalled_worker.clone(),
     );
 
+    let rss_sampler = spawn_rss_sampler(stop.clone(), Duration::from_millis(100));
+
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
         if stalled_worker.load(Ordering::SeqCst) != NO_STALL {
@@ -213,6 +217,7 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
     }
     stop.store(true, Ordering::SeqCst);
     let _ = watchdog.join();
+    let _ = rss_sampler.join();
 
     let mut aggregate = OpLatencies::new();
     for (id, handle) in handles.into_iter().enumerate() {
@@ -236,6 +241,7 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
     dump_summary(scenario.name(), &aggregate);
 
     assert_peak_reserved_invariant(scenario.name(), scenario.peak_reserved_ceiling_bytes());
+    assert_peak_rss_invariant(scenario.name(), scenario.peak_reserved_ceiling_bytes());
     assert_teardown_invariants(scenario.name());
     assert_p100_latency(scenario.name(), &aggregate, scenario.max_latency());
 
@@ -280,6 +286,37 @@ fn spawn_watchdog(
                 }
             }
         }
+    })
+}
+
+/// Spawn a thread that samples the current process's RSS every `interval` and records it
+/// into the `process.memory_usage` gauge, matching the metric name the production binary
+/// emits from `mountpoint_s3_fs::metrics::poll_process_metrics`. Adapted from
+/// `examples/s3io_benchmark/monitoring.rs` (`MemoryMonitor` / `monitor_memory_loop`),
+/// translated from a tokio task to a sync `std::thread` driven by the harness's stop flag.
+fn spawn_rss_sampler(stop: Arc<AtomicBool>, interval: Duration) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let Ok(pid) = get_current_pid() else {
+            tracing::warn!("stress: get_current_pid failed; RSS sampling disabled");
+            return;
+        };
+        let mut sys = System::new();
+        let sample = |sys: &mut System| {
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                false,
+                ProcessRefreshKind::nothing().with_memory(),
+            );
+            if let Some(process) = sys.process(pid) {
+                metrics::gauge!(PROCESS_MEMORY_USAGE).set(process.memory() as f64);
+            }
+        };
+        while !stop.load(Ordering::Relaxed) {
+            sample(&mut sys);
+            thread::sleep(interval);
+        }
+        // Final sample so the teardown peak is captured (mirrors `MemoryMonitor::stop`).
+        sample(&mut sys);
     })
 }
 
@@ -365,6 +402,51 @@ fn assert_peak_reserved_invariant(scenario_name: &str, mem_limit: f64) {
             scenario = scenario_name,
             ?violations,
             "stress: peak-reserved invariant violated (warn-only until mem-limiter accounting is tightened)"
+        );
+    }
+}
+
+/// Assert the peak sampled `process.memory_usage` (OS-reported RSS) stayed under
+/// `ceiling_bytes`. Mirrors [`assert_peak_reserved_invariant`]: peak comes from the gauge's
+/// HDR history, and violations are logged at warn until mem-limiter accounting is tightened.
+fn assert_peak_rss_invariant(scenario_name: &str, ceiling_bytes: f64) {
+    let Some(recorder) = stress_recorder::recorder() else {
+        tracing::warn!(
+            scenario = scenario_name,
+            "stress: no recorder installed, skipping peak-rss invariant"
+        );
+        return;
+    };
+    let Some(metric) = recorder.get("process.memory_usage", &[]) else {
+        tracing::warn!(
+            scenario = scenario_name,
+            "stress: process.memory_usage not recorded, skipping peak-rss invariant"
+        );
+        return;
+    };
+    let peak = metric.gauge_history().max();
+    let ceiling = ceiling_bytes as u64;
+    tracing::info!(
+        scenario = scenario_name,
+        peak = %format_mib(peak),
+        ceiling = %format_mib(ceiling),
+        "stress: peak process.memory_usage"
+    );
+    let mut violations: Vec<String> = Vec::new();
+    if peak > ceiling {
+        violations.push(format!(
+            "process.memory_usage peak {} exceeds mem_limit {}",
+            format_mib(peak),
+            format_mib(ceiling),
+        ));
+    }
+    // TODO(mem-limiter): promote from warn to assert once production accounting is tight
+    // enough that breaches indicate real regressions rather than known-gap overshoot.
+    if !violations.is_empty() {
+        tracing::warn!(
+            scenario = scenario_name,
+            ?violations,
+            "stress: peak-rss invariant violated (warn-only until mem-limiter accounting is tightened)"
         );
     }
 }
@@ -618,6 +700,22 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         wd.join().unwrap();
         assert_eq!(stalled.load(Ordering::SeqCst), 1, "worker 1 should have been flagged");
+    }
+
+    #[test]
+    fn rss_sampler_records_gauge() {
+        crate::common::stress_recorder::install();
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn_rss_sampler(stop.clone(), Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(300));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        let recorder = crate::common::stress_recorder::recorder().expect("installed");
+        let m = recorder
+            .get("process.memory_usage", &[])
+            .expect("gauge registered");
+        assert!(m.gauge_history().len() >= 1);
+        assert!(m.gauge() > 0.0);
     }
 
     #[test]
