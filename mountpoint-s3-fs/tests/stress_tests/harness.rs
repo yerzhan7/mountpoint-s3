@@ -240,10 +240,13 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
 
     dump_summary(scenario.name(), &aggregate);
 
+    tracing::info!("");
+    tracing::info!("=== stress [{}] invariant assertions ===", scenario.name());
     assert_peak_reserved_invariant(scenario.name(), scenario.peak_reserved_ceiling_bytes());
     assert_peak_rss_invariant(scenario.name(), scenario.peak_reserved_ceiling_bytes());
     assert_teardown_invariants(scenario.name());
     assert_p100_latency(scenario.name(), &aggregate, scenario.max_latency());
+    tracing::info!("");
 
     tracing::info!(scenario = scenario.name(), "stress: finished");
 }
@@ -405,7 +408,14 @@ fn assert_peak_reserved_invariant(scenario_name: &str, mem_limit: f64) {
         tracing::warn!(
             scenario = scenario_name,
             ?violations,
-            "stress: peak-reserved invariant violated (warn-only until mem-limiter accounting is tightened)"
+            "stress: assertion FAILED (warn-only) — peak-reserved invariant (ceiling {})",
+            format_mib(effective_budget),
+        );
+    } else {
+        tracing::info!(
+            scenario = scenario_name,
+            "stress: assertion PASSED — peak-reserved invariant (ceiling {})",
+            format_mib(effective_budget),
         );
     }
 }
@@ -450,7 +460,14 @@ fn assert_peak_rss_invariant(scenario_name: &str, ceiling_bytes: f64) {
         tracing::warn!(
             scenario = scenario_name,
             ?violations,
-            "stress: peak-rss invariant violated (warn-only until mem-limiter accounting is tightened)"
+            "stress: assertion FAILED (warn-only) — peak-rss invariant (ceiling {})",
+            format_mib(ceiling),
+        );
+    } else {
+        tracing::info!(
+            scenario = scenario_name,
+            "stress: assertion PASSED — peak-rss invariant (ceiling {})",
+            format_mib(ceiling),
         );
     }
 }
@@ -484,6 +501,18 @@ fn assert_teardown_invariants(scenario_name: &str) {
                 leaks.push(format!("pool.reserved_bytes{{kind={kind}}} = {v}"));
             }
         }
+    }
+    if leaks.is_empty() {
+        tracing::info!(
+            scenario = scenario_name,
+            "stress: assertion PASSED — teardown invariants (all reservation gauges back to zero)"
+        );
+    } else {
+        tracing::error!(
+            scenario = scenario_name,
+            ?leaks,
+            "stress: assertion FAILED — teardown invariants"
+        );
     }
     assert!(leaks.is_empty(), "teardown invariant violated:\n  {}", leaks.join("\n  "));
 }
@@ -519,6 +548,7 @@ fn dump_summary(scenario_name: &str, aggregate: &OpLatencies) {
         );
     }
 
+    tracing::info!("");
     tracing::info!("=== stress [{scenario_name}] global metrics ===");
     let Some(recorder) = stress_recorder::recorder() else {
         tracing::info!("(no global recorder installed)");
@@ -591,12 +621,23 @@ fn assert_p100_latency(scenario_name: &str, aggregate: &OpLatencies, max_latency
         }
     }
     if !violations.is_empty() {
+        tracing::error!(
+            scenario = scenario_name,
+            ?violations,
+            "stress: assertion FAILED — p100 latency invariant (ceiling {}ms)",
+            us_to_ms_str(max_us),
+        );
         panic!(
             "stress: scenario {:?} violated p100 latency ceiling:\n  {}",
             scenario_name,
             violations.join("\n  "),
         );
     }
+    tracing::info!(
+        scenario = scenario_name,
+        "stress: assertion PASSED — p100 latency invariant (ceiling {}ms)",
+        us_to_ms_str(max_us),
+    );
 }
 
 #[cfg(test)]
