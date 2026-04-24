@@ -35,10 +35,6 @@ const WATCHDOG_POLL: Duration = Duration::from_secs(1);
 /// Sentinel value meaning "no stall detected".
 const NO_STALL: usize = usize::MAX;
 
-/// At teardown, total `mem.bytes_reserved` across areas must be zero: every handle has been
-/// dropped and every reservation must have been decremented.
-const TEARDOWN_RESERVED_MAX_BYTES: f64 = 0.0;
-
 /// A stress-test scenario. Implementations describe a load shape; the harness drives it.
 pub trait Scenario: Send + Sync {
     /// Short name used for logging and as the S3 test prefix component.
@@ -405,10 +401,9 @@ fn assert_teardown_invariants(scenario_name: &str) {
         "stress: teardown mem.bytes_reserved"
     );
     assert!(
-        total <= TEARDOWN_RESERVED_MAX_BYTES,
-        "teardown invariant violated: sum(mem.bytes_reserved) = {} bytes, expected {} (per-area: {:?})",
+        total == 0.0,
+        "teardown invariant violated: sum(mem.bytes_reserved) = {} bytes (per-area: {:?})",
         total,
-        TEARDOWN_RESERVED_MAX_BYTES,
         per_area,
     );
 }
