@@ -172,7 +172,7 @@ All scenarios set `mem_limit = MINIMUM_MEM_LIMIT` (512 MiB) via
 At teardown the harness prints (via `tracing::info!`):
 
 1. A **worker op latency table** built from merged per-worker
-   `OpLatencies` HDR histograms — one line per op with count and
+   `FileOpLatencies` HDR histograms — one line per op with count and
    p50/p90/p99/p100 in ms, e.g.
 
    ```
@@ -205,22 +205,22 @@ At teardown the harness prints (via `tracing::info!`):
        worker_id: usize,
        mount_path: &Path,
        progress: &AtomicU64,
-       latencies: &mut OpLatencies,
+       latencies: &mut FileOpLatencies,
        stop: &AtomicBool,
    );
    ```
 
-   Wrap every file-system operation in `latencies.time(Op::_, || ...)` so
+   Wrap every file-system operation in `latencies.time(FileOp::_, || ...)` so
    the harness can aggregate per-op latency distributions. For example:
 
    ```rust
    let mut file = latencies
-       .time(Op::Open, || File::open(&path))
+       .time(FileOp::Open, || File::open(&path))
        .unwrap_or_else(|e| panic!("open failed: {e:?}"));
    let n = latencies
-       .time(Op::Read, || file.read(&mut buf))
+       .time(FileOp::Read, || file.read(&mut buf))
        .unwrap_or_else(|e| panic!("read failed: {e:?}"));
-   latencies.time(Op::Close, || drop(file));
+   latencies.time(FileOp::Close, || drop(file));
    ```
 
 4. If the scenario needs a shared test object, add a helper in
@@ -244,7 +244,7 @@ Worker bodies should:
   shows up as liveness.
 - Readers / open-read-close loops: bump progress on every successful open in
   addition to the bytes read.
-- Time every op via `latencies.time(Op::_, || ...)`. The `p100` assertion is
+- Time every op via `latencies.time(FileOp::_, || ...)`. The `p100` assertion is
   aggregated across workers per op.
 - Check `stop.load(Ordering::Relaxed)` frequently and return when set.
 - **Not** tolerate errors from `File::open`/`File::create`/`read`/`write`.

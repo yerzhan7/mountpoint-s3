@@ -63,7 +63,7 @@ pub trait Scenario: Send + Sync {
         worker_id: usize,
         mount_path: &Path,
         progress: &AtomicU64,
-        latencies: &mut OpLatencies,
+        latencies: &mut FileOpLatencies,
         stop: &AtomicBool,
     );
 
@@ -79,34 +79,34 @@ pub trait Scenario: Send + Sync {
     }
 }
 
-/// File operations timed by [`OpLatencies`].
+/// File operations timed by [`FileOpLatencies`].
 #[derive(Clone, Copy, Debug)]
-pub enum Op {
+pub enum FileOp {
     Open = 0,
     Read = 1,
     Write = 2,
     Close = 3,
 }
 
-impl Op {
-    pub const ALL: [Op; 4] = [Op::Open, Op::Read, Op::Write, Op::Close];
+impl FileOp {
+    pub const ALL: [FileOp; 4] = [FileOp::Open, FileOp::Read, FileOp::Write, FileOp::Close];
 
     pub fn name(self) -> &'static str {
         match self {
-            Op::Open => "open",
-            Op::Read => "read",
-            Op::Write => "write",
-            Op::Close => "close",
+            FileOp::Open => "open",
+            FileOp::Read => "read",
+            FileOp::Write => "write",
+            FileOp::Close => "close",
         }
     }
 }
 
 /// Per-worker op-latency histograms. Each worker owns one; the harness merges them at teardown.
-pub struct OpLatencies {
+pub struct FileOpLatencies {
     histograms: [HdrHistogram<u64>; 4],
 }
 
-impl OpLatencies {
+impl FileOpLatencies {
     pub fn new() -> Self {
         let mk = || HdrHistogram::<u64>::new_with_bounds(1, 600_000_000, 3).expect("HDR bounds valid");
         Self {
@@ -115,7 +115,7 @@ impl OpLatencies {
     }
 
     /// Time `f` and record its elapsed microseconds under `op`.
-    pub fn time<R>(&mut self, op: Op, f: impl FnOnce() -> R) -> R {
+    pub fn time<R>(&mut self, op: FileOp, f: impl FnOnce() -> R) -> R {
         let start = Instant::now();
         let out = f();
         let elapsed_us = start.elapsed().as_micros();
@@ -126,19 +126,19 @@ impl OpLatencies {
         out
     }
 
-    pub fn histogram(&self, op: Op) -> &HdrHistogram<u64> {
+    pub fn histogram(&self, op: FileOp) -> &HdrHistogram<u64> {
         &self.histograms[op as usize]
     }
 
-    pub fn merge(&mut self, other: &OpLatencies) {
-        for op in Op::ALL {
+    pub fn merge(&mut self, other: &FileOpLatencies) {
+        for op in FileOp::ALL {
             // Safe: both histograms share the same bounds.
             let _ = self.histograms[op as usize].add(&other.histograms[op as usize]);
         }
     }
 }
 
-impl Default for OpLatencies {
+impl Default for FileOpLatencies {
     fn default() -> Self {
         Self::new()
     }
@@ -185,14 +185,14 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
     let max_idles: Vec<Duration> = (0..num_workers).map(|i| scenario.max_idle_duration(i)).collect();
 
     let mount_path: std::path::PathBuf = session.mount_path().to_path_buf();
-    let mut handles: Vec<thread::JoinHandle<OpLatencies>> = Vec::with_capacity(num_workers);
+    let mut handles: Vec<thread::JoinHandle<FileOpLatencies>> = Vec::with_capacity(num_workers);
     for worker_id in 0..num_workers {
         let scenario = scenario.clone();
         let stop = stop.clone();
         let progress = progress[worker_id].clone();
         let mount_path = mount_path.clone();
         handles.push(thread::spawn(move || {
-            let mut latencies = OpLatencies::new();
+            let mut latencies = FileOpLatencies::new();
             scenario.run_worker(worker_id, &mount_path, &progress, &mut latencies, &stop);
             latencies
         }));
@@ -219,7 +219,7 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
     let _ = watchdog.join();
     let _ = rss_sampler.join();
 
-    let mut aggregate = OpLatencies::new();
+    let mut aggregate = FileOpLatencies::new();
     for (id, handle) in handles.into_iter().enumerate() {
         let rec = handle
             .join()
@@ -539,9 +539,9 @@ fn format_mib(bytes: u64) -> String {
 }
 
 /// Print a per-op worker latency table followed by the global HdrRecorder snapshot.
-fn dump_summary(scenario_name: &str, aggregate: &OpLatencies) {
+fn dump_summary(scenario_name: &str, aggregate: &FileOpLatencies) {
     tracing::info!("=== STRESS [{scenario_name}] WORKER OP LATENCIES ===");
-    for op in Op::ALL {
+    for op in FileOp::ALL {
         let h = aggregate.histogram(op);
         let count = h.len();
         if count == 0 {
@@ -612,10 +612,10 @@ fn dump_summary(scenario_name: &str, aggregate: &OpLatencies) {
 
 /// Assert that the merged per-op p100 latency is within `max_latency`. Ops with zero samples
 /// are skipped (e.g. read-only scenarios never record a write sample).
-fn assert_p100_latency(scenario_name: &str, aggregate: &OpLatencies, max_latency: Duration) {
+fn assert_p100_latency(scenario_name: &str, aggregate: &FileOpLatencies, max_latency: Duration) {
     let max_us = max_latency.as_micros().min(u64::MAX as u128) as u64;
     let mut violations: Vec<String> = Vec::new();
-    for op in Op::ALL {
+    for op in FileOp::ALL {
         let h = aggregate.histogram(op);
         if h.len() == 0 {
             continue;
@@ -660,31 +660,31 @@ mod tests {
     }
 
     #[test]
-    fn op_latencies_time_and_merge() {
-        let mut a = OpLatencies::new();
-        let r = a.time(Op::Open, || 42);
+    fn file_op_latencies_time_and_merge() {
+        let mut a = FileOpLatencies::new();
+        let r = a.time(FileOp::Open, || 42);
         assert_eq!(r, 42);
-        assert_eq!(a.histogram(Op::Open).len(), 1);
-        a.time(Op::Read, || ());
-        let mut b = OpLatencies::new();
-        b.time(Op::Open, || ());
+        assert_eq!(a.histogram(FileOp::Open).len(), 1);
+        a.time(FileOp::Read, || ());
+        let mut b = FileOpLatencies::new();
+        b.time(FileOp::Open, || ());
         a.merge(&b);
-        assert_eq!(a.histogram(Op::Open).len(), 2);
-        assert_eq!(a.histogram(Op::Read).len(), 1);
+        assert_eq!(a.histogram(FileOp::Open).len(), 2);
+        assert_eq!(a.histogram(FileOp::Read).len(), 1);
     }
 
     #[test]
     #[should_panic(expected = "violated p100 latency ceiling")]
     fn assert_p100_latency_flags_outlier() {
-        let mut agg = OpLatencies::new();
+        let mut agg = FileOpLatencies::new();
         // Record a 6s read sample (in µs).
-        agg.histograms[Op::Read as usize].record(6_000_000).unwrap();
+        agg.histograms[FileOp::Read as usize].record(6_000_000).unwrap();
         assert_p100_latency("test", &agg, Duration::from_secs(5));
     }
 
     #[test]
     fn assert_p100_latency_skips_empty_ops() {
-        let agg = OpLatencies::new();
+        let agg = FileOpLatencies::new();
         assert_p100_latency("test", &agg, Duration::from_secs(5));
     }
 

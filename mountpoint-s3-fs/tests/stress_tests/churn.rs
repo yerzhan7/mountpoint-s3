@@ -14,7 +14,7 @@ use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 use mountpoint_s3_fs::s3::S3Path;
 
 use crate::common::fuse::{TestSession, TestSessionConfig};
-use crate::stress_tests::harness::{self, Op, Scenario, OpLatencies};
+use crate::stress_tests::harness::{self, FileOp, Scenario, FileOpLatencies};
 use crate::stress_tests::test_objects::{self, SMALL_SET_COUNT, SMALL_SET_SIZE, small_object_key};
 
 const NUM_SHORT_WORKERS: usize = 48;
@@ -49,7 +49,7 @@ impl Scenario for Churn {
         worker_id: usize,
         mount_path: &Path,
         progress: &AtomicU64,
-        latencies: &mut OpLatencies,
+        latencies: &mut FileOpLatencies,
         stop: &AtomicBool,
     ) {
         if worker_id < NUM_SHORT_WORKERS {
@@ -64,7 +64,7 @@ fn short_loop(
     worker_id: usize,
     mount_path: &Path,
     progress: &AtomicU64,
-    latencies: &mut OpLatencies,
+    latencies: &mut FileOpLatencies,
     stop: &AtomicBool,
 ) {
     let mut buf = vec![0u8; SMALL_SET_SIZE];
@@ -75,7 +75,7 @@ fn short_loop(
         let idx = (iter.wrapping_mul(2_654_435_761).wrapping_add(worker_id as u64) as usize) % SMALL_SET_COUNT;
         let path = mount_path.join(small_object_key(idx));
         let mut file = latencies
-            .time(Op::Open, || File::open(&path))
+            .time(FileOp::Open, || File::open(&path))
             .unwrap_or_else(|e| {
                 panic!("churn: worker {worker_id}: open of {path:?} failed: {e:?}");
             });
@@ -83,7 +83,7 @@ fn short_loop(
         let mut read = 0usize;
         while read < SMALL_SET_SIZE && !stop.load(Ordering::Relaxed) {
             let n = latencies
-                .time(Op::Read, || file.read(&mut buf[read..]))
+                .time(FileOp::Read, || file.read(&mut buf[read..]))
                 .unwrap_or_else(|e| {
                     panic!("churn: worker {worker_id}: read of {path:?} failed: {e:?}");
                 });
@@ -93,7 +93,7 @@ fn short_loop(
             read += n;
             progress.fetch_add(n as u64, Ordering::Relaxed);
         }
-        latencies.time(Op::Close, || drop(file));
+        latencies.time(FileOp::Close, || drop(file));
     }
 }
 
@@ -104,7 +104,7 @@ fn idle_loop(
     worker_id: usize,
     mount_path: &Path,
     progress: &AtomicU64,
-    latencies: &mut OpLatencies,
+    latencies: &mut FileOpLatencies,
     stop: &AtomicBool,
 ) {
     let mut buf = vec![0u8; IDLE_READ_BYTES];
@@ -114,7 +114,7 @@ fn idle_loop(
         let idx = (iter.wrapping_mul(2_246_822_519).wrapping_add(worker_id as u64) as usize) % SMALL_SET_COUNT;
         let path = mount_path.join(small_object_key(idx));
         let mut file = latencies
-            .time(Op::Open, || File::open(&path))
+            .time(FileOp::Open, || File::open(&path))
             .unwrap_or_else(|e| {
                 panic!("churn: idle worker {worker_id}: open of {path:?} failed: {e:?}");
             });
@@ -125,7 +125,7 @@ fn idle_loop(
         let mut read = 0usize;
         while read < IDLE_READ_BYTES.min(SMALL_SET_SIZE) && !stop.load(Ordering::Relaxed) {
             let n = latencies
-                .time(Op::Read, || file.read(&mut buf[read..]))
+                .time(FileOp::Read, || file.read(&mut buf[read..]))
                 .unwrap_or_else(|e| {
                     panic!("churn: idle worker {worker_id}: read of {path:?} failed: {e:?}");
                 });
@@ -141,7 +141,7 @@ fn idle_loop(
         while Instant::now() < idle_deadline && !stop.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(500));
         }
-        latencies.time(Op::Close, || drop(file));
+        latencies.time(FileOp::Close, || drop(file));
         progress.fetch_add(1, Ordering::Relaxed);
     }
 }

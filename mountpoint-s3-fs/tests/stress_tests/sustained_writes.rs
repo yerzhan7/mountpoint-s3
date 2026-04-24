@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 
 use crate::common::fuse::TestSessionConfig;
-use crate::stress_tests::harness::{self, Op, Scenario, OpLatencies};
+use crate::stress_tests::harness::{self, FileOp, Scenario, FileOpLatencies};
 
 const NUM_WORKERS: usize = 48;
 const WRITE_CHUNK: usize = 8 * 1024 * 1024; // 8 MiB — matches default part size
@@ -37,7 +37,7 @@ impl Scenario for SustainedWrites {
         worker_id: usize,
         mount_path: &Path,
         progress: &AtomicU64,
-        latencies: &mut OpLatencies,
+        latencies: &mut FileOpLatencies,
         stop: &AtomicBool,
     ) {
         let mut iter: u64 = 0;
@@ -49,7 +49,7 @@ impl Scenario for SustainedWrites {
             let path = mount_path.join(&key);
 
             let mut file = latencies
-                .time(Op::Open, || File::create(&path))
+                .time(FileOp::Open, || File::create(&path))
                 .unwrap_or_else(|e| {
                     panic!("sustained_writes: worker {worker_id}: create failed: {e:?}");
                 });
@@ -59,14 +59,14 @@ impl Scenario for SustainedWrites {
             while written < size && !stop.load(Ordering::Relaxed) {
                 let n = (size - written).min(WRITE_CHUNK);
                 latencies
-                    .time(Op::Write, || file.write_all(&chunk[..n]))
+                    .time(FileOp::Write, || file.write_all(&chunk[..n]))
                     .unwrap_or_else(|e| {
                         panic!("sustained_writes: worker {worker_id}: write failed: {e:?}");
                     });
                 written += n;
                 progress.fetch_add(n as u64, Ordering::Relaxed);
             }
-            latencies.time(Op::Close, || drop(file));
+            latencies.time(FileOp::Close, || drop(file));
             progress.fetch_add(1, Ordering::Relaxed);
             // Best-effort cleanup so we don't accumulate thousands of objects during long runs.
             let _ = std::fs::remove_file(&path);
