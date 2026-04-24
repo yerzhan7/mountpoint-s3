@@ -26,7 +26,7 @@ env:
   # the end-of-run tracing dump visible while suppressing CRT and SDK warn/error noise
   # (credential-chain probes, 404 heads, CRT ERROR on recoverable conditions) that would
   # dominate a long run's CI log without signaling a real failure.
-  RUST_LOG: "warn,r#mod=info"
+  RUST_LOG: "warn,r#mod=info,awscrt=off"
   # Reuse the bench bucket for fixture storage — shared stress test objects live at
   # `${S3_BUCKET_TEST_PREFIX}stress-fixtures/` and are never deleted.
   S3_BUCKET_NAME: ${{ vars.S3_BENCH_BUCKET_NAME }}
