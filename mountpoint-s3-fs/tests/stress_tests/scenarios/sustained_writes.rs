@@ -64,7 +64,14 @@ impl Scenario for SustainedWrites {
                 written += n;
                 progress.fetch_add(n as u64, Ordering::Relaxed);
             }
-            latencies.time(FileOp::CloseWrite, || drop(file));
+            // `sync_all` (not implicit `drop`) so MPU-complete errors surface — `Drop for File`
+            // swallows the `close(2)` return value.
+            latencies
+                .time(FileOp::CloseWrite, || file.sync_all())
+                .unwrap_or_else(|e| {
+                    panic!("sustained_writes: worker {worker_id}: sync_all failed: {e:?}");
+                });
+            drop(file);
             progress.fetch_add(1, Ordering::Relaxed);
             // Best-effort cleanup so we don't accumulate thousands of objects during long runs.
             let _ = std::fs::remove_file(&path);

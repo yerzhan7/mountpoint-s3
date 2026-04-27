@@ -117,7 +117,14 @@ fn writer_loop(
             written += n;
             progress.fetch_add(n as u64, Ordering::Relaxed);
         }
-        latencies.time(FileOp::CloseWrite, || drop(file));
+        // `sync_all` (not implicit `drop`) so MPU-complete errors surface — `Drop for File`
+        // swallows the `close(2)` return value.
+        latencies
+            .time(FileOp::CloseWrite, || file.sync_all())
+            .unwrap_or_else(|e| {
+                panic!("mixed_rw: writer {writer_id}: sync_all failed: {e:?}");
+            });
+        drop(file);
         progress.fetch_add(1, Ordering::Relaxed);
         let _ = std::fs::remove_file(&path);
     }
