@@ -169,13 +169,13 @@ out of the default `cargo test` path. Always pass `--run-ignored only`.
 | Name               | Workers   | What it does                                                                       |
 |--------------------|-----------|------------------------------------------------------------------------------------|
 | `smoke`            | 1         | Reads a 4 KiB object in a loop. Sanity-check that the harness works.               |
-| `sustained_reads`  | 32        | Front-to-back-read the shared 1 GiB test object, re-open on EOF.                   |
-| `sustained_writes` | 48        | Write 50–200 MiB objects and delete them.                                          |
-| `mixed_rw`         | 16 + 24   | 16 readers against the shared 1 GiB test object + 24 writers in the same session.  |
-| `churn`            | 48 + 8    | 48 short-lived readers over 100 shared small test objects + 8 idle-held handles.   |
+| `sustained_reads`  | 32        | Front-to-back-read the shared 100 GiB test object, re-open on EOF.                 |
+| `sustained_writes` | 48        | Write 100 MiB objects and delete them.                                             |
+| `mixed_rw`         | 16 + 24   | 16 readers against the shared 100 GiB test object + 24 writers in the same session.|
+| `idle_and_churn`   | 48 + 8    | 48 short-lived readers over 100 shared small test objects + 8 idle-held handles.   |
 
-The idle workers in `churn` each perform a 1 MiB read after opening a handle
-before going idle, so the handle has a prefetcher reservation registered with
+The idle workers in `idle_and_churn` each read the small object (128 KiB) fully after opening
+a handle before going idle, so the handle has a prefetcher reservation registered with
 the memory limiter and is a valid pruning candidate while it sits idle.
 
 All scenarios set `mem_limit = MINIMUM_MEM_LIMIT` (512 MiB) via

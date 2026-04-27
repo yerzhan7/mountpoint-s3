@@ -56,7 +56,7 @@ jobs:
           - sustained_reads
           - sustained_writes
           - mixed_rw
-          - churn
+          - idle_and_churn
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
