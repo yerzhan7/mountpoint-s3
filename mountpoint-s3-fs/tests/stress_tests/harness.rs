@@ -193,6 +193,11 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
     let stalled_worker = Arc::new(AtomicUsize::new(NO_STALL));
 
     let max_idles: Vec<Duration> = (0..num_workers).map(|i| scenario.max_idle_duration(i)).collect();
+    let max_join_wait = max_idles
+        .iter()
+        .copied()
+        .max()
+        .expect("scenario must declare at least one worker");
 
     let mount_path: std::path::PathBuf = session.mount_path().to_path_buf();
     let mut handles: Vec<thread::JoinHandle<FileOpLatencies>> = Vec::with_capacity(num_workers);
@@ -228,6 +233,25 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
     stop.store(true, Ordering::SeqCst);
     let _ = watchdog.join();
     let _ = rss_sampler.join();
+
+    // Bounded join: workers observe `stop` between ops and should finish quickly. If any
+    // are wedged in a kernel FUSE syscall they cannot observe `stop` and `JoinHandle` has
+    // no timeout API, so we poll `is_finished()` up to a deadline. On timeout we drop
+    // (unmount) the session to force EIO/EINTR on stuck syscalls, then panic with the
+    // stuck worker IDs — CI gets a real diagnostic instead of a silent hang.
+    let join_deadline = Instant::now() + max_join_wait;
+    while !handles.iter().all(|h| h.is_finished()) {
+        if Instant::now() >= join_deadline {
+            let stuck: Vec<usize> = handles
+                .iter()
+                .enumerate()
+                .filter_map(|(id, h)| (!h.is_finished()).then_some(id))
+                .collect();
+            drop(session);
+            panic!("stress: workers {stuck:?} did not finish within {max_join_wait:?} after stop");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 
     let mut aggregate = FileOpLatencies::new();
     for (id, handle) in handles.into_iter().enumerate() {
