@@ -27,8 +27,8 @@ env:
   # (credential-chain probes, 404 heads, CRT ERROR on recoverable conditions) that would
   # dominate a long run's CI log without signaling a real failure.
   RUST_LOG: "warn,r#mod=info,awscrt=off"
-  # Reuse the bench bucket for fixture storage — shared stress test objects live at
-  # `${S3_BUCKET_TEST_PREFIX}stress-fixtures/` and are never deleted.
+  # Reuse the bench bucket for shared test object storage — shared stress test objects
+  # live at `${S3_BUCKET_TEST_PREFIX}shared-stress-test-objects/` and are never deleted.
   S3_BUCKET_NAME: ${{ vars.S3_BENCH_BUCKET_NAME }}
   S3_BUCKET_TEST_PREFIX: ${{ vars.S3_BUCKET_BENCH_PREFIX || 'mountpoint-benchmark/' }}
   S3_ENDPOINT_URL: ${{ vars.S3_BENCH_ENDPOINT_URL }}

@@ -74,19 +74,30 @@ Optional stress-specific variables:
 
 ## Shared test objects
 
-Several scenarios read a large (1 GiB) or small (128 KiB × 100) object from a
+Several scenarios read a large (100 GiB) or small (128 KiB × 100) object from a
 *shared*, non-nonced prefix so that consecutive runs don't pay the upload cost
 every time:
 
-    <S3_BUCKET_TEST_PREFIX>stress-fixtures/read_1gib.bin
-    <S3_BUCKET_TEST_PREFIX>stress-fixtures/small_0000.bin
+    <S3_BUCKET_TEST_PREFIX>shared-stress-test-objects/read_100gib.bin
+    <S3_BUCKET_TEST_PREFIX>shared-stress-test-objects/small_0000.bin
     ...
-    <S3_BUCKET_TEST_PREFIX>stress-fixtures/small_0099.bin
+    <S3_BUCKET_TEST_PREFIX>shared-stress-test-objects/small_0099.bin
 
 Scenarios that need these objects mount directly at the
-`<S3_BUCKET_TEST_PREFIX>stress-fixtures/` prefix (via
-`Scenario::s3_path_override`) and upload-if-missing in `setup()` via a `HEAD`
-then `PutObject`. These objects are **never deleted** by the harness.
+`<S3_BUCKET_TEST_PREFIX>shared-stress-test-objects/` prefix (via
+`Scenario::s3_path_override`) and upload-if-missing in `setup()` by calling
+`test_objects::ensure_shared_objects(&[(key, size), ...])`. The helper
+HEADs each key, skips any object already present at the expected size, and
+otherwise streams the body via Mountpoint's own `Uploader`
+(`start_atomic_upload`) through a single reused part-sized buffer. The
+uploader's part size is sized off the largest object in the list so even
+multi-hundred-GiB test objects fit within S3's 10,000-part MPU cap. The
+test object uploader runs with its own `PagedPool` and a `MemoryLimiter`
+budgeted at 95% of total system memory (floored at `MINIMUM_MEM_LIMIT`),
+so test object upload is independent of the memory limit the scenario
+under test has configured.
+
+These objects are **never deleted** by the harness.
 
 The harness enables `allow_delete` and `allow_overwrite` on the mount so
 scenarios can best-effort `remove_file` their ephemeral objects through the

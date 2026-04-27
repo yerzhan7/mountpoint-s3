@@ -15,7 +15,7 @@ use mountpoint_s3_fs::s3::S3Path;
 
 use crate::common::fuse::{TestSession, TestSessionConfig};
 use crate::stress_tests::harness::{self, FileOp, Scenario, FileOpLatencies};
-use crate::stress_tests::test_objects::{self, READ_OBJECT_KEY};
+use crate::stress_tests::test_objects::{self, LARGE_OBJECT_KEY, LARGE_OBJECT_SIZE};
 const NUM_READERS: usize = 16;
 const NUM_WRITERS: usize = 24;
 const READ_CHUNK: usize = 8 * 1024 * 1024; // 8 MiB — matches default part size
@@ -38,14 +38,14 @@ impl Scenario for MixedRw {
     }
 
     fn s3_path_override(&self) -> Option<S3Path> {
-        // Mount at the shared stress-fixtures prefix so readers can see the shared 1 GiB
+        // Mount at the shared stress test objects prefix so readers can see the shared 100 GiB
         // test object. Writers must use their own key namespace so they cannot collide with
         // the shared read object.
         Some(test_objects::shared_s3_path())
     }
 
     fn setup(&self, _session: &TestSession) {
-        test_objects::ensure_read_object();
+        test_objects::ensure_shared_objects(&[(LARGE_OBJECT_KEY, LARGE_OBJECT_SIZE)]);
     }
 
     fn run_worker(
@@ -71,7 +71,7 @@ fn reader_loop(
     latencies: &mut FileOpLatencies,
     stop: &AtomicBool,
 ) {
-    let path = mount_path.join(READ_OBJECT_KEY);
+    let path = mount_path.join(LARGE_OBJECT_KEY);
     let mut buf = vec![0u8; READ_CHUNK];
     while !stop.load(Ordering::Relaxed) {
         let mut file = latencies
@@ -111,7 +111,7 @@ fn writer_loop(
     while !stop.load(Ordering::Relaxed) {
         iter += 1;
         // Namespace writer keys with a per-run nonce so they never collide with shared
-        // fixtures or leftover objects from prior runs. Flat (no '/') so we don't need to
+        // test objects or leftover objects from prior runs. Flat (no '/') so we don't need to
         // mkdir intermediate prefixes through mountpoint.
         let key = format!(
             "mixed_rw_ephemeral_{}_w{writer_id:03}_i{iter:06}.bin",

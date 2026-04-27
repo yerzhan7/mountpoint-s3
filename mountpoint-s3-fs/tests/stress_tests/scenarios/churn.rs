@@ -41,7 +41,11 @@ impl Scenario for Churn {
     }
 
     fn setup(&self, _session: &TestSession) {
-        test_objects::ensure_small_set();
+        let objs: Vec<(String, usize)> = (0..SMALL_SET_COUNT)
+            .map(|i| (small_object_key(i), SMALL_SET_SIZE))
+            .collect();
+        let refs: Vec<(&str, usize)> = objs.iter().map(|(k, s)| (k.as_str(), *s)).collect();
+        test_objects::ensure_shared_objects(&refs);
     }
 
     fn run_worker(

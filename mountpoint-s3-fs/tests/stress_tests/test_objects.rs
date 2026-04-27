@@ -1,30 +1,38 @@
 //! Shared, reusable stress test objects.
 //!
-//! These objects live at a stable, non-nonced S3 prefix (`<S3_BUCKET_TEST_PREFIX>stress-fixtures/`)
-//! and are uploaded on demand (HEAD, then `PutObject` only if missing). They are never deleted —
+//! These objects live at a stable, non-nonced S3 prefix
+//! (`<S3_BUCKET_TEST_PREFIX>shared-stress-test-objects/`) and are uploaded on demand via
+//! Mountpoint's own [`Uploader`] if missing or the wrong size. They are never deleted —
 //! multiple stress runs reuse the same objects to avoid paying the upload cost on every run.
 //!
-//! Scenarios that need a shared test object mount directly at the `stress-fixtures/` prefix
-//! by overriding [`crate::stress_tests::harness::Scenario::s3_path_override`] with
-//! [`shared_s3_path`].
+//! Scenarios that need a shared test object mount directly at the
+//! `shared-stress-test-objects/` prefix by overriding
+//! [`crate::stress_tests::harness::Scenario::s3_path_override`] with [`shared_s3_path`].
+
+use std::sync::Arc;
 
 use aws_sdk_s3::Client;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
-use aws_sdk_s3::primitives::ByteStream;
+use mountpoint_s3_client::S3CrtClient;
+use mountpoint_s3_client::config::S3ClientConfig;
+use mountpoint_s3_fs::Runtime;
+use mountpoint_s3_fs::mem_limiter::{MINIMUM_MEM_LIMIT, MemoryLimiter};
+use mountpoint_s3_fs::memory::PagedPool;
 use mountpoint_s3_fs::s3::{Bucket, Prefix, S3Path};
+use mountpoint_s3_fs::upload::{Uploader, UploaderConfig};
 
-use crate::common::s3::{get_test_bucket, get_test_region, get_test_sdk_client};
+use crate::common::s3::{get_test_bucket, get_test_endpoint_config, get_test_region, get_test_sdk_client};
 use crate::common::tokio_block_on;
 
 /// Stable suffix appended to `S3_BUCKET_TEST_PREFIX` for shared stress test objects.
-const SHARED_PREFIX_SUFFIX: &str = "stress-fixtures/";
+const SHARED_PREFIX_SUFFIX: &str = "shared-stress-test-objects/";
 
-/// Key (inside the shared prefix) for the 1 GiB read object used by `sustained_reads`
+/// Key (inside the shared prefix) for the large read object used by `sustained_reads`
 /// and `mixed_rw`.
-pub const READ_OBJECT_KEY: &str = "read_1gib.bin";
+pub const LARGE_OBJECT_KEY: &str = "read_100gib.bin";
 
-/// Size of the shared 1 GiB read object.
-pub const READ_OBJECT_SIZE: usize = 1024 * 1024 * 1024;
+/// Size of the shared large read object (100 GiB).
+pub const LARGE_OBJECT_SIZE: usize = 100 * 1024 * 1024 * 1024;
 
 /// Number of small shared objects used by `churn`.
 pub const SMALL_SET_COUNT: usize = 100;
@@ -41,7 +49,7 @@ pub fn small_object_key(index: usize) -> String {
 ///
 /// Scenarios that mount against [`shared_s3_path`] must place their writable output under
 /// `ephemeral/<scenario>/<ephemeral_run_id>/...` so they cannot collide with either the
-/// shared fixtures or leftover objects from prior runs. The returned string does not contain
+/// shared test objects or leftover objects from prior runs. The returned string does not contain
 /// path separators and is stable for the lifetime of the test process.
 pub fn ephemeral_run_id() -> &'static str {
     use std::sync::OnceLock;
@@ -56,17 +64,17 @@ pub fn ephemeral_run_id() -> &'static str {
     })
 }
 
-/// Return the shared prefix (e.g. `mountpoint-test/stress-fixtures/`).
+/// Return the shared prefix (e.g. `mountpoint-test/shared-stress-test-objects/`).
 fn shared_prefix_string() -> String {
     let base = std::env::var("S3_BUCKET_TEST_PREFIX").unwrap_or_else(|_| String::from("mountpoint-test/"));
     assert!(base.ends_with('/'), "S3_BUCKET_TEST_PREFIX should end in '/'");
     format!("{base}{SHARED_PREFIX_SUFFIX}")
 }
 
-/// An `S3Path` pointing at the shared stress-fixtures prefix.
+/// An `S3Path` pointing at the shared stress test objects prefix.
 ///
 /// Scenarios that mount at this path can read the shared objects by their short key
-/// (`READ_OBJECT_KEY`, `small_object_key(i)`), and should namespace any ephemeral writes
+/// (`LARGE_OBJECT_KEY`, `small_object_key(i)`), and should namespace any ephemeral writes
 /// so they cannot collide with the shared keys.
 pub fn shared_s3_path() -> S3Path {
     let bucket = get_test_bucket();
@@ -74,58 +82,125 @@ pub fn shared_s3_path() -> S3Path {
     S3Path::new(Bucket::new(bucket).unwrap(), Prefix::new(&prefix).unwrap())
 }
 
-/// Upload the 1 GiB shared read object if it is not already present.
-pub fn ensure_read_object() {
-    let payload = vec![0xA5u8; READ_OBJECT_SIZE];
-    ensure_object(READ_OBJECT_KEY, &payload);
-}
-
-/// Upload the 100 small shared objects if they are not already present.
-pub fn ensure_small_set() {
-    let payload = vec![0x5Au8; SMALL_SET_SIZE];
-    for i in 0..SMALL_SET_COUNT {
-        ensure_object(&small_object_key(i), &payload);
+/// Upload the given `(key, size)` shared test objects if they are not already present at the
+/// expected size. All objects are filled with [`TEST_OBJECT_FILL_BYTE`] and share a single
+/// `Uploader<S3CrtClient>` whose part size is sized off the largest object in the list, so
+/// the caller gets one CRT client setup per call regardless of how many objects are uploaded.
+pub fn ensure_shared_objects(objects: &[(&str, usize)]) {
+    if objects.is_empty() {
+        return;
+    }
+    let max_size = objects.iter().map(|(_, s)| *s).max().unwrap_or(0);
+    let (uploader, bucket, part_size) = build_test_object_uploader(max_size);
+    for (key, size) in objects {
+        upload_test_object_with_uploader(&uploader, &bucket, part_size, key, *size);
     }
 }
 
-fn ensure_object(key: &str, payload: &[u8]) {
-    let bucket = get_test_bucket();
-    let region = get_test_region();
-    let full_key = format!("{}{}", shared_prefix_string(), key);
-
-    tokio_block_on(async {
-        let client: Client = get_test_sdk_client(&region).await;
-        if object_exists(&client, &bucket, &full_key).await {
-            tracing::debug!(bucket, key = %full_key, "stress: shared test object already present");
-            return;
-        }
-        tracing::info!(
-            bucket,
-            key = %full_key,
-            size = payload.len(),
-            "stress: uploading shared test object"
-        );
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(&full_key)
-            .body(ByteStream::from(payload.to_vec()))
-            .send()
-            .await
-            .expect("failed to upload shared stress test object");
-    });
-}
-
-async fn object_exists(client: &Client, bucket: &str, key: &str) -> bool {
+async fn head_object_size(client: &Client, bucket: &str, key: &str) -> Option<usize> {
     match client.head_object().bucket(bucket).key(key).send().await {
-        Ok(_) => true,
+        Ok(head) => Some(head.content_length().expect("HEAD response missing content_length") as usize),
         Err(e) => {
             let service_err = e.into_service_error();
             if matches!(service_err, HeadObjectError::NotFound(_)) {
-                false
+                None
             } else {
                 panic!("HEAD failed for s3://{bucket}/{key}: {service_err:?}");
             }
         }
     }
+}
+
+const DEFAULT_WRITE_PART_SIZE: usize = 8 * 1024 * 1024;
+const MAX_PARTS: u64 = 10_000;
+const TEST_OBJECT_FILL_BYTE: u8 = 0xA5;
+
+/// Memory budget for the test object uploader: 95% of total system memory, floored at
+/// `MINIMUM_MEM_LIMIT`. Matches the pattern used by Mountpoint.
+fn compute_test_object_mem_budget() -> u64 {
+    use sysinfo::{RefreshKind, System};
+    let sys = System::new_with_specifics(RefreshKind::everything());
+    let ninety_five_pct = ((sys.total_memory() as f64) * 0.95) as u64;
+    ninety_five_pct.max(MINIMUM_MEM_LIMIT)
+}
+
+/// Build an `Uploader<S3CrtClient>` for shared test object uploads. Part size is raised above
+/// `DEFAULT_WRITE_PART_SIZE` if needed so `max_object_size` fits within the 10,000-part MPU
+/// cap. Returns the uploader, the test bucket name, and the chosen part size (so the write
+/// loop can reuse a single part-sized buffer).
+///
+/// Built with its own `PagedPool` and `MemoryLimiter` so test object upload is independent of
+/// whatever memory limit the scenario under test has configured.
+fn build_test_object_uploader(max_object_size: usize) -> (Uploader<S3CrtClient>, String, usize) {
+    let bucket = get_test_bucket();
+    let min_part_size = (max_object_size as u64).div_ceil(MAX_PARTS) as usize;
+    let part_size = DEFAULT_WRITE_PART_SIZE.max(min_part_size);
+
+    let pool = PagedPool::new_with_candidate_sizes([part_size]);
+    let mem_limiter = Arc::new(MemoryLimiter::new(pool.clone(), compute_test_object_mem_budget()));
+
+    let client_config = S3ClientConfig::default()
+        .part_size(part_size)
+        .endpoint_config(get_test_endpoint_config())
+        .memory_pool(pool.clone());
+    let client = S3CrtClient::new(client_config).expect("failed to build S3CrtClient for test object upload");
+    let runtime = Runtime::new(client.event_loop_group());
+    let uploader = Uploader::new(client, runtime, pool, mem_limiter, UploaderConfig::new(part_size));
+
+    (uploader, bucket, part_size)
+}
+
+/// HEAD-skip-if-size-matches, else stream-upload a shared test object of `size` bytes (all
+/// [`TEST_OBJECT_FILL_BYTE`]) at `<shared prefix>/<key>` via Mountpoint's own [`Uploader`].
+fn upload_test_object_with_uploader(
+    uploader: &Uploader<S3CrtClient>,
+    bucket: &str,
+    part_size: usize,
+    key: &str,
+    size: usize,
+) {
+    let full_key = format!("{}{}", shared_prefix_string(), key);
+
+    // HEAD via a fresh SDK client: cheap per call, and uses the same credential chain as the
+    // rest of the test helpers.
+    let region = get_test_region();
+    let present = tokio_block_on(async {
+        let client: Client = get_test_sdk_client(&region).await;
+        head_object_size(&client, bucket, &full_key).await == Some(size)
+    });
+    if present {
+        tracing::debug!(bucket, key = %full_key, "stress: shared test object already present");
+        return;
+    }
+
+    tracing::info!(
+        bucket,
+        key = %full_key,
+        size,
+        part_size,
+        "stress: uploading shared test object"
+    );
+
+    tokio_block_on(async {
+        let mut request = uploader
+            .start_atomic_upload(bucket.to_string(), full_key.clone())
+            .unwrap_or_else(|e| panic!("failed to start MPU for s3://{bucket}/{full_key}: {e:?}"));
+
+        let buf = vec![TEST_OBJECT_FILL_BYTE; part_size];
+        let mut offset = 0u64;
+        while offset < size as u64 {
+            let remaining = size as u64 - offset;
+            let chunk = remaining.min(part_size as u64) as usize;
+            let written = request
+                .write(offset as i64, &buf[..chunk])
+                .await
+                .unwrap_or_else(|e| panic!("write failed at offset {offset} for s3://{bucket}/{full_key}: {e:?}"));
+            offset += written as u64;
+        }
+
+        request
+            .complete()
+            .await
+            .unwrap_or_else(|e| panic!("failed to complete MPU for s3://{bucket}/{full_key}: {e:?}"));
+    });
 }

@@ -1,4 +1,4 @@
-//! `sustained_reads`: 32 workers concurrently reading a ~1 GiB shared test object front-to-back
+//! `sustained_reads`: 32 workers concurrently reading a ~100 GiB shared test object front-to-back
 //! under the 512 MiB memory limit. Exercises prefetch reservation, window growth, and pruning
 //! interactions under sustained read pressure.
 
@@ -12,7 +12,7 @@ use mountpoint_s3_fs::s3::S3Path;
 
 use crate::common::fuse::{TestSession, TestSessionConfig};
 use crate::stress_tests::harness::{self, FileOp, Scenario, FileOpLatencies};
-use crate::stress_tests::test_objects::{self, READ_OBJECT_KEY};
+use crate::stress_tests::test_objects::{self, LARGE_OBJECT_KEY, LARGE_OBJECT_SIZE};
 
 const READ_CHUNK: usize = 8 * 1024 * 1024; // 8 MiB — matches default part size
 const NUM_WORKERS: usize = 32;
@@ -37,7 +37,7 @@ impl Scenario for SustainedReads {
     }
 
     fn setup(&self, _session: &TestSession) {
-        test_objects::ensure_read_object();
+        test_objects::ensure_shared_objects(&[(LARGE_OBJECT_KEY, LARGE_OBJECT_SIZE)]);
     }
 
     fn run_worker(
@@ -48,7 +48,7 @@ impl Scenario for SustainedReads {
         latencies: &mut FileOpLatencies,
         stop: &AtomicBool,
     ) {
-        let path = mount_path.join(READ_OBJECT_KEY);
+        let path = mount_path.join(LARGE_OBJECT_KEY);
         let mut buf = vec![0u8; READ_CHUNK];
         while !stop.load(Ordering::Relaxed) {
             let mut file = latencies
