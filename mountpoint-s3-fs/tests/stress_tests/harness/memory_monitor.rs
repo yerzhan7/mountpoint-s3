@@ -1,4 +1,4 @@
-//! RSS sampler thread. Populates the `process.memory_usage` gauge with the OS-reported
+//! Memory monitor thread. Populates the `process.memory_usage` gauge with the OS-reported
 //! RSS so teardown invariants can assert on peak process memory.
 
 use std::sync::Arc;
@@ -12,10 +12,10 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, get_current_pid};
 /// Spawn a thread that samples the current process's RSS every `interval` and records it
 /// into the `process.memory_usage` gauge, matching the metric name the production binary
 /// emits from `mountpoint_s3_fs::metrics::poll_process_metrics`.
-pub(super) fn spawn_rss_sampler(stop: Arc<AtomicBool>, interval: Duration) -> thread::JoinHandle<()> {
+pub(super) fn spawn_memory_monitor(stop: Arc<AtomicBool>, interval: Duration) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let Ok(pid) = get_current_pid() else {
-            tracing::warn!("stress: get_current_pid failed; RSS sampling disabled");
+            tracing::warn!("stress: get_current_pid failed; memory monitor disabled");
             return;
         };
         let mut sys = System::new();

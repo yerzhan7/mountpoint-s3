@@ -15,15 +15,15 @@ use crate::common::stress_recorder;
 
 mod invariants;
 mod latency;
+mod memory_monitor;
 mod report;
-mod rss_sampler;
 mod watchdog;
 pub use latency::{FileOp, FileOpLatencies};
 use invariants::{
     assert_p100_latency, assert_peak_reserved_invariant, assert_peak_rss_invariant, assert_teardown_invariants,
 };
+use memory_monitor::spawn_memory_monitor;
 use report::dump_summary;
-use rss_sampler::spawn_rss_sampler;
 use watchdog::{NO_STALL, spawn_watchdog};
 
 /// Default scenario duration if `STRESS_DURATION_SECS` is unset.
@@ -152,7 +152,7 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
         stalled_worker.clone(),
     );
 
-    let rss_sampler = spawn_rss_sampler(stop.clone(), Duration::from_millis(100));
+    let memory_monitor = spawn_memory_monitor(stop.clone(), Duration::from_millis(100));
 
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
@@ -163,7 +163,7 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
     }
     stop.store(true, Ordering::SeqCst);
     let _ = watchdog.join();
-    let _ = rss_sampler.join();
+    let _ = memory_monitor.join();
 
     // Bounded join: workers observe `stop` between ops and should finish quickly. If any
     // are wedged in a kernel FUSE syscall they cannot observe `stop` and `JoinHandle` has
@@ -346,10 +346,10 @@ mod tests {
     }
 
     #[test]
-    fn rss_sampler_records_gauge() {
+    fn memory_monitor_records_gauge() {
         crate::common::stress_recorder::install();
         let stop = Arc::new(AtomicBool::new(false));
-        let handle = spawn_rss_sampler(stop.clone(), Duration::from_millis(50));
+        let handle = spawn_memory_monitor(stop.clone(), Duration::from_millis(50));
         thread::sleep(Duration::from_millis(300));
         stop.store(true, Ordering::SeqCst);
         handle.join().unwrap();
