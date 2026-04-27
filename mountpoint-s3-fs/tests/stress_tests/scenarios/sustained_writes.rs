@@ -66,7 +66,7 @@ impl Scenario for SustainedWrites {
                 written += n;
                 progress.fetch_add(n as u64, Ordering::Relaxed);
             }
-            latencies.time(FileOp::Close, || drop(file));
+            latencies.time(FileOp::CloseWrite, || drop(file));
             progress.fetch_add(1, Ordering::Relaxed);
             // Best-effort cleanup so we don't accumulate thousands of objects during long runs.
             let _ = std::fs::remove_file(&path);

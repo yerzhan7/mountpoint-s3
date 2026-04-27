@@ -47,7 +47,7 @@ impl Scenario for SmokeScenario {
             let mut buf = Vec::with_capacity(PAYLOAD_LEN);
             let mut f = latencies.time(FileOp::Open, || File::open(&path)).unwrap();
             let n = latencies.time(FileOp::Read, || f.read_to_end(&mut buf)).unwrap();
-            latencies.time(FileOp::Close, || drop(f));
+            latencies.time(FileOp::CloseRead, || drop(f));
             progress.fetch_add(n as u64, Ordering::Relaxed);
         }
     }

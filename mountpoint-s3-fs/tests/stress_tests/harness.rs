@@ -87,32 +87,40 @@ pub enum FileOp {
     Open = 0,
     Read = 1,
     Write = 2,
-    Close = 3,
+    CloseRead = 3,
+    CloseWrite = 4,
 }
 
 impl FileOp {
-    pub const ALL: [FileOp; 4] = [FileOp::Open, FileOp::Read, FileOp::Write, FileOp::Close];
+    pub const ALL: [FileOp; 5] = [
+        FileOp::Open,
+        FileOp::Read,
+        FileOp::Write,
+        FileOp::CloseRead,
+        FileOp::CloseWrite,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             FileOp::Open => "open",
             FileOp::Read => "read",
             FileOp::Write => "write",
-            FileOp::Close => "close",
+            FileOp::CloseRead => "close_read",
+            FileOp::CloseWrite => "close_write",
         }
     }
 }
 
 /// Per-worker op-latency histograms. Each worker owns one; the harness merges them at teardown.
 pub struct FileOpLatencies {
-    histograms: [HdrHistogram<u64>; 4],
+    histograms: [HdrHistogram<u64>; 5],
 }
 
 impl FileOpLatencies {
     pub fn new() -> Self {
         let mk = || HdrHistogram::<u64>::new_with_bounds(1, 600_000_000, 3).expect("HDR bounds valid");
         Self {
-            histograms: [mk(), mk(), mk(), mk()],
+            histograms: [mk(), mk(), mk(), mk(), mk()],
         }
     }
 
@@ -562,9 +570,9 @@ fn dump_summary(scenario_name: &str, aggregate: &FileOpLatencies) {
     }
 
     tracing::info!("");
-    tracing::info!("=== STRESS [{scenario_name}] GLOBAL METRICS ===");
+    tracing::info!("=== STRESS [{scenario_name}] AGGREGATED MOUNTPOINT METRICS ===");
     let Some(recorder) = stress_recorder::recorder() else {
-        tracing::info!("(no global recorder installed)");
+        tracing::info!("(no stress recorder installed)");
         return;
     };
     let mut lines: Vec<(String, String)> = Vec::new();

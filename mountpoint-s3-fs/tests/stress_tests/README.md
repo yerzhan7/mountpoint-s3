@@ -26,8 +26,9 @@ bugs in the memory limiter and pruner.
   Peaks are not summed across labels — summing per-label peaks over-
   estimates the true peak of the sum, and per-label checks give sharper
   failure attribution.
-- For each worker op (`open`, `read`, `write`, `close`) aggregated across
-  every worker, the p100 latency is within `Scenario::max_latency(op)`.
+- For each worker op (`open`, `read`, `write`, `close_read`, `close_write`)
+  aggregated across every worker, the p100 latency is within
+  `Scenario::max_latency(op)`.
   Default is 30 s for every op; scenarios can override per op (mirrors the
   per-worker `max_idle_duration(worker_id)` shape). Ops with zero samples
   are skipped.
@@ -193,10 +194,11 @@ At teardown the harness prints (via `tracing::info!`):
    op=open count=96 p50=475.6ms p90=536.6ms p99=536.6ms p100=536.6ms
    op=read count=9664 p50=965.1ms p90=1264.6ms p99=1612.8ms p100=1946.6ms
    op=write count=0
-   op=close count=64 p50=0.4ms p90=17.7ms p99=30.0ms p100=30.0ms
+   op=close_read count=64 p50=0.4ms p90=17.7ms p99=30.0ms p100=30.0ms
+   op=close_write count=0
    ```
 
-2. A **global metrics snapshot** from the `HdrRecorder` (HDR-backed
+2. A **Aggregated Mountpoint metrics snapshot** from the `HdrRecorder` (HDR-backed
    replacement for `TestRecorder` that ingests every `metrics::` emission
    from production code during the run). Histograms are printed as raw HDR
    values (unit varies per metric — bytes / µs / MiB / count — infer from
@@ -233,8 +235,12 @@ At teardown the harness prints (via `tracing::info!`):
    let n = latencies
        .time(FileOp::Read, || file.read(&mut buf))
        .unwrap_or_else(|e| panic!("read failed: {e:?}"));
-   latencies.time(FileOp::Close, || drop(file));
+   latencies.time(FileOp::CloseRead, || drop(file));
    ```
+
+   Use `FileOp::CloseRead` for files opened for reading and `FileOp::CloseWrite`
+   for files opened for writing — close latencies are bimodal across the two
+   (MPU finalize can dominate the write path).
 
 4. If the scenario needs a shared test object, add a helper in
    `tests/stress_tests/test_objects.rs` (HEAD + `PutObject`-if-missing),

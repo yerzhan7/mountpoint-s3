@@ -72,7 +72,7 @@ impl Scenario for SustainedReads {
                 }
                 progress.fetch_add(n as u64, Ordering::Relaxed);
             }
-            latencies.time(FileOp::Close, || drop(file));
+            latencies.time(FileOp::CloseRead, || drop(file));
         }
     }
 }

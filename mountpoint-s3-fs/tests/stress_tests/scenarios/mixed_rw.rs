@@ -95,7 +95,7 @@ fn reader_loop(
             }
             progress.fetch_add(n as u64, Ordering::Relaxed);
         }
-        latencies.time(FileOp::Close, || drop(file));
+        latencies.time(FileOp::CloseRead, || drop(file));
     }
 }
 
@@ -137,7 +137,7 @@ fn writer_loop(
             written += n;
             progress.fetch_add(n as u64, Ordering::Relaxed);
         }
-        latencies.time(FileOp::Close, || drop(file));
+        latencies.time(FileOp::CloseWrite, || drop(file));
         progress.fetch_add(1, Ordering::Relaxed);
         let _ = std::fs::remove_file(&path);
     }

@@ -97,7 +97,7 @@ fn short_loop(
             read += n;
             progress.fetch_add(n as u64, Ordering::Relaxed);
         }
-        latencies.time(FileOp::Close, || drop(file));
+        latencies.time(FileOp::CloseRead, || drop(file));
     }
 }
 
@@ -145,7 +145,7 @@ fn idle_loop(
         while Instant::now() < idle_deadline && !stop.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(500));
         }
-        latencies.time(FileOp::Close, || drop(file));
+        latencies.time(FileOp::CloseRead, || drop(file));
         progress.fetch_add(1, Ordering::Relaxed);
     }
 }
