@@ -10,8 +10,8 @@ use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 
 use crate::common::fuse::TestSessionConfig;
 use crate::stress_tests::harness::{self, FileOp, Scenario, FileOpLatencies};
+use crate::stress_tests::test_objects;
 
-const KEY: &str = "smoke.bin";
 const PAYLOAD_LEN: usize = 4096;
 
 struct SmokeScenario;
@@ -31,7 +31,7 @@ impl Scenario for SmokeScenario {
 
     fn setup(&self, session: &crate::common::fuse::TestSession) {
         let payload = vec![0xABu8; PAYLOAD_LEN];
-        session.client().put_object(KEY, &payload).unwrap();
+        session.client().put_object(&smoke_key(), &payload).unwrap();
     }
 
     fn run_worker(
@@ -42,7 +42,7 @@ impl Scenario for SmokeScenario {
         latencies: &mut FileOpLatencies,
         stop: &AtomicBool,
     ) {
-        let path = mount_path.join(KEY);
+        let path = mount_path.join(smoke_key());
         while !stop.load(Ordering::Relaxed) {
             let mut buf = Vec::with_capacity(PAYLOAD_LEN);
             let mut f = latencies.time(FileOp::Open, || File::open(&path)).unwrap();
@@ -51,6 +51,11 @@ impl Scenario for SmokeScenario {
             progress.fetch_add(n as u64, Ordering::Relaxed);
         }
     }
+}
+
+/// Per-run smoke object key. Flat + nonced so concurrent runs don't collide.
+fn smoke_key() -> String {
+    test_objects::ephemeral_key("stress_smoke", "smoke.bin")
 }
 
 #[test]

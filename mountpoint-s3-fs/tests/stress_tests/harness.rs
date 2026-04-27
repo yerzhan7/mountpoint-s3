@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use mountpoint_s3_fs::metrics::defs::PROCESS_MEMORY_USAGE;
-use mountpoint_s3_fs::s3::S3Path;
+use mountpoint_s3_fs::s3::{Bucket, Prefix, S3Path};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, get_current_pid};
 
 use crate::common::fuse::{self, TestSession, TestSessionConfig};
@@ -33,10 +33,10 @@ pub trait Scenario: Send + Sync {
     fn name(&self) -> &str;
 
     /// Maximum time worker `worker_id` may go without incrementing its progress counter
-    /// before the watchdog declares it stalled. The default is 30s for all workers.
+    /// before the watchdog declares it stalled. The default is 10s for all workers.
     /// The API still supports per-worker thresholds for scenarios that need them.
     fn max_idle_duration(&self, _worker_id: usize) -> Duration {
-        Duration::from_secs(30)
+        Duration::from_secs(10)
     }
 
     /// Number of worker threads to spawn.
@@ -44,13 +44,6 @@ pub trait Scenario: Send + Sync {
 
     /// Session configuration for this scenario (memory limit, part size, etc.).
     fn session_config(&self) -> TestSessionConfig;
-
-    /// If `Some`, the harness mounts against this `S3Path` instead of a per-scenario nonced
-    /// prefix. Scenarios that depend on shared stress test objects return
-    /// [`crate::stress_tests::test_objects::shared_s3_path`] here.
-    fn s3_path_override(&self) -> Option<S3Path> {
-        None
-    }
 
     /// One-time setup (e.g. upload test objects). Runs before any worker starts.
     fn setup(&self, _session: &TestSession) {}
@@ -73,11 +66,10 @@ pub trait Scenario: Send + Sync {
         self.session_config().filesystem_config.mem_limit as f64
     }
 
-    /// Maximum allowed p100 latency for `op`, aggregated across all workers. Default 30s for
-    /// every op; scenarios override per op when they have different natural profiles (e.g.
-    /// `open`/`close` on S3 cover create + flush/MPU-complete and run longer than `read`/`write`).
+    /// Maximum allowed p100 latency for `op`, aggregated across all workers. Default 10s for
+    /// every op; scenarios may override per op if they have a different natural profile.
     fn max_latency(&self, _op: FileOp) -> Duration {
-        Duration::from_secs(30)
+        Duration::from_secs(10)
     }
 }
 
@@ -154,6 +146,16 @@ impl Default for FileOpLatencies {
     }
 }
 
+/// Return the `S3Path` every stress scenario mounts at: `<S3_BUCKET_NAME>/<S3_BUCKET_TEST_PREFIX>`
+/// (no per-scenario nonce). Shared test objects live at `shared-stress-test-objects/...` under
+/// this mount; ephemeral writer keys live flat at the root under a per-run nonce.
+fn stress_mount_s3_path() -> S3Path {
+    let bucket = crate::common::s3::get_test_bucket();
+    let prefix = std::env::var("S3_BUCKET_TEST_PREFIX").unwrap_or_else(|_| String::from("mountpoint-test/"));
+    assert!(prefix.ends_with('/'), "S3_BUCKET_TEST_PREFIX should end in '/'");
+    S3Path::new(Bucket::new(bucket).unwrap(), Prefix::new(&prefix).unwrap())
+}
+
 /// Run the given scenario. Reads `STRESS_DURATION_SECS` from env; default 30s.
 pub fn run<S: Scenario + 'static>(scenario: S) {
     // Make sure the snapshotting recorder is installed even if the common-module ctor has not
@@ -175,15 +177,15 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
         // Enable delete + overwrite so scenarios can best-effort clean up test objects
         config.filesystem_config.allow_delete = true;
         config.filesystem_config.allow_overwrite = true;
-        match scenario.s3_path_override() {
-            Some(s3_path) => {
-                let region = crate::common::s3::get_test_region();
-                let sdk_client =
-                    crate::common::tokio_block_on(async { crate::common::s3::get_test_sdk_client(&region).await });
-                fuse::s3_session::new_with_test_client(config, sdk_client, s3_path)
-            }
-            None => fuse::s3_session::new(scenario.name(), config),
-        }
+        // All stress scenarios mount at the root of `S3_BUCKET_TEST_PREFIX` so shared test
+        // objects (at `shared-stress-test-objects/...`) and per-run ephemeral writer keys
+        // (see `test_objects::ephemeral_key`) live in the same namespace. The per-run nonce
+        // baked into ephemeral keys keeps concurrent runs from colliding.
+        let s3_path = stress_mount_s3_path();
+        let region = crate::common::s3::get_test_region();
+        let sdk_client =
+            crate::common::tokio_block_on(async { crate::common::s3::get_test_sdk_client(&region).await });
+        fuse::s3_session::new_with_test_client(config, sdk_client, s3_path)
     };
     scenario.setup(&session);
 

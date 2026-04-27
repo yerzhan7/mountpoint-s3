@@ -11,6 +11,7 @@ use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 
 use crate::common::fuse::TestSessionConfig;
 use crate::stress_tests::harness::{self, FileOp, FileOpLatencies, Scenario};
+use crate::stress_tests::test_objects;
 
 const NUM_WORKERS: usize = 48;
 const WRITE_CHUNK: usize = 8 * 1024 * 1024; // 8 MiB — matches default part size
@@ -43,7 +44,9 @@ impl Scenario for SustainedWrites {
         let chunk = vec![0xC3u8; WRITE_CHUNK];
         while !stop.load(Ordering::Relaxed) {
             iter += 1;
-            let key = format!("w{worker_id:03}_i{iter:06}.bin");
+            // Flat, per-run-nonced key so writes never collide with shared test objects,
+            // leftover objects from prior runs, or concurrent runs.
+            let key = test_objects::ephemeral_key("sustained_writes", &format!("w{worker_id:03}_i{iter:06}.bin"));
             let path = mount_path.join(&key);
 
             let mut file = latencies

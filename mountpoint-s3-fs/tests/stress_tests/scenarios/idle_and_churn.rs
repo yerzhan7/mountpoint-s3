@@ -3,9 +3,6 @@
 //! 48 churn workers open a random shared small object, read it fully, close; repeated.
 //! 8 idle workers open a handle, read the small object fully (triggering a prefetcher
 //! reservation), then hold the handle idle for 5-15s before closing and re-opening.
-//!
-//! Targets handle-lifecycle races and creates natural pruning candidates for future pruning
-//! strategies.
 
 use std::fs::File;
 use std::io::Read;
@@ -14,12 +11,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
-use mountpoint_s3_fs::s3::S3Path;
 
 use crate::common::fuse::{TestSession, TestSessionConfig};
 use crate::stress_tests::harness::{self, FileOp, FileOpLatencies, Scenario};
 use crate::stress_tests::scenarios::common::read_to_eof_once;
-use crate::stress_tests::test_objects::{self, SMALL_SET_COUNT, SMALL_SET_SIZE, small_object_key};
+use crate::stress_tests::test_objects::{SHARED_MOUNT_PREFIX, SMALL_SET_COUNT, SMALL_SET_SIZE, ensure_shared_objects, small_object_key};
 
 const NUM_CHURN_WORKERS: usize = 48;
 const NUM_IDLE_WORKERS: usize = 8;
@@ -39,16 +35,12 @@ impl Scenario for IdleAndChurn {
         TestSessionConfig::default().with_mem_limit(MINIMUM_MEM_LIMIT)
     }
 
-    fn s3_path_override(&self) -> Option<S3Path> {
-        Some(test_objects::shared_s3_path())
-    }
-
     fn setup(&self, _session: &TestSession) {
         let objs: Vec<(String, usize)> = (0..SMALL_SET_COUNT)
             .map(|i| (small_object_key(i), SMALL_SET_SIZE))
             .collect();
         let refs: Vec<(&str, usize)> = objs.iter().map(|(k, s)| (k.as_str(), *s)).collect();
-        test_objects::ensure_shared_objects(&refs);
+        ensure_shared_objects(&refs);
     }
 
     fn run_worker(
@@ -63,7 +55,9 @@ impl Scenario for IdleAndChurn {
         let mut iter: u64 = 0;
         while !stop.load(Ordering::Relaxed) {
             iter += 1;
-            let path = mount_path.join(small_object_key(pick_index(iter, worker_id)));
+            let path = mount_path
+                .join(SHARED_MOUNT_PREFIX)
+                .join(small_object_key(pick_index(iter, worker_id)));
             if worker_id < NUM_CHURN_WORKERS {
                 read_to_eof_once("idle_and_churn churn", &path, &mut buf, progress, latencies, stop);
             } else {

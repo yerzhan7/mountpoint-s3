@@ -84,12 +84,12 @@ every time:
     ...
     <S3_BUCKET_TEST_PREFIX>shared-stress-test-objects/small_0099.bin
 
-Scenarios that need these objects mount directly at the
-`<S3_BUCKET_TEST_PREFIX>shared-stress-test-objects/` prefix (via
-`Scenario::s3_path_override`) and upload-if-missing in `setup()` by calling
-`test_objects::ensure_shared_objects(&[(key, size), ...])`. The helper
-HEADs each key, skips any object already present at the expected size, and
-otherwise streams the body via Mountpoint's own `Uploader`
+All scenarios mount at the `<S3_BUCKET_TEST_PREFIX>` root, so shared objects
+are visible through the mount at the relative path `shared-stress-test-objects/<key>`
+(use `test_objects::SHARED_MOUNT_PREFIX`). Scenarios upload-if-missing in
+`setup()` by calling `test_objects::ensure_shared_objects(&[(key, size), ...])`.
+The helper HEADs each key, skips any object already present at the expected
+size, and otherwise streams the body via Mountpoint's own `Uploader`
 (`start_atomic_upload`) through a single reused part-sized buffer. The
 uploader's part size is sized off the largest object in the list so even
 multi-hundred-GiB test objects fit within S3's 10,000-part MPU cap. The
@@ -103,8 +103,12 @@ These objects are **never deleted** by the harness.
 The harness enables `allow_delete` and `allow_overwrite` on the mount so
 scenarios can best-effort `remove_file` their ephemeral objects through the
 mount and so a new run does not hit `EPERM` on a key that a prior run wrote.
-Writer scenarios still namespace their ephemeral keys with a per-run nonce
-from `test_objects::ephemeral_run_id()` for readability, not correctness.
+Writer scenarios namespace their ephemeral keys via
+`test_objects::ephemeral_key(scenario, suffix)`, which produces a flat
+(no `/` → no `mkdir` through the mount) key of the form
+`ephemeral_<ephemeral_run_id>_<scenario>_<suffix>` so writes from different
+workers, iterations, scenarios, and concurrent runs cannot collide with each
+other or with the shared test objects.
 
 ## How to run
 
@@ -210,7 +214,7 @@ At teardown the harness prints (via `tracing::info!`):
 1. Create `tests/stress_tests/scenarios/my_scenario.rs`.
 2. Implement `crate::stress_tests::harness::Scenario`: at minimum `name`,
    `num_workers`, `session_config`, and `run_worker`. Override
-   `max_idle_duration`, `max_latency` (takes a `FileOp`), `s3_path_override`,
+   `max_idle_duration`, `max_latency` (takes a `FileOp`),
    `peak_reserved_ceiling_bytes`, and `setup` only if the defaults don't fit.
 3. `run_worker` has the signature
 
@@ -244,8 +248,11 @@ At teardown the harness prints (via `tracing::info!`):
 
 4. If the scenario needs a shared test object, add a helper in
    `tests/stress_tests/test_objects.rs` (HEAD + `PutObject`-if-missing),
-   return `Some(test_objects::shared_s3_path())` from `s3_path_override`, and
-   upload-if-missing from `setup()`.
+   upload-if-missing from `setup()`, and open it through the mount at the
+   relative path `test_objects::SHARED_MOUNT_PREFIX`-joined with your key.
+   For writable output, use `test_objects::ephemeral_key(scenario, suffix)`
+   to produce a flat, per-run-nonced key that can't collide with the shared
+   test objects, prior runs, or concurrent runs.
 5. Add a `#[test] #[ignore = "stress test; run with --run-ignored only"]`
    entry point that calls `harness::run(MyScenario)`.
 6. Register the module in `tests/stress_tests/scenarios/mod.rs`.

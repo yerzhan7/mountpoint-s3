@@ -5,9 +5,8 @@
 //! Mountpoint's own [`Uploader`] if missing or the wrong size. They are never deleted —
 //! multiple stress runs reuse the same objects to avoid paying the upload cost on every run.
 //!
-//! Scenarios that need a shared test object mount directly at the
-//! `shared-stress-test-objects/` prefix by overriding
-//! [`crate::stress_tests::harness::Scenario::s3_path_override`] with [`shared_s3_path`].
+//! Scenarios mount at the `<S3_BUCKET_TEST_PREFIX>` root and read shared objects via the
+//! `shared-stress-test-objects/<key>` relative path under the mount.
 
 use std::sync::Arc;
 
@@ -18,7 +17,6 @@ use mountpoint_s3_client::config::S3ClientConfig;
 use mountpoint_s3_fs::Runtime;
 use mountpoint_s3_fs::mem_limiter::{MINIMUM_MEM_LIMIT, MemoryLimiter};
 use mountpoint_s3_fs::memory::PagedPool;
-use mountpoint_s3_fs::s3::{Bucket, Prefix, S3Path};
 use mountpoint_s3_fs::upload::{Uploader, UploaderConfig};
 
 use crate::common::s3::{get_test_bucket, get_test_endpoint_config, get_test_region, get_test_sdk_client};
@@ -26,6 +24,11 @@ use crate::common::tokio_block_on;
 
 /// Stable suffix appended to `S3_BUCKET_TEST_PREFIX` for shared stress test objects.
 const SHARED_PREFIX_SUFFIX: &str = "shared-stress-test-objects/";
+
+/// Path (relative to the mount) under which shared test objects are visible. Scenarios join
+/// this with a key from [`LARGE_OBJECT_KEY`] / [`small_object_key`] to open a shared object
+/// through the mount.
+pub const SHARED_MOUNT_PREFIX: &str = SHARED_PREFIX_SUFFIX;
 
 /// Key (inside the shared prefix) for the large read object used by `sustained_reads`
 /// and `mixed_rw`.
@@ -45,12 +48,12 @@ pub fn small_object_key(index: usize) -> String {
     format!("small_{index:04}.bin")
 }
 
-/// A process-wide, per-run nonce directory segment for ephemeral writer objects.
+/// A process-wide, per-run nonce for ephemeral writer keys.
 ///
-/// Scenarios that mount against [`shared_s3_path`] must place their writable output under
-/// `ephemeral/<scenario>/<ephemeral_run_id>/...` so they cannot collide with either the
-/// shared test objects or leftover objects from prior runs. The returned string does not contain
-/// path separators and is stable for the lifetime of the test process.
+/// Writer scenarios must namespace their ephemeral output so it cannot collide with either
+/// the shared test objects, leftover objects from prior runs, or other concurrent runs. Use
+/// [`ephemeral_key`] to construct a namespaced flat key (no '/' → no `mkdir` through the
+/// mount required).
 pub fn ephemeral_run_id() -> &'static str {
     use std::sync::OnceLock;
     static RUN_ID: OnceLock<String> = OnceLock::new();
@@ -64,22 +67,18 @@ pub fn ephemeral_run_id() -> &'static str {
     })
 }
 
+/// Build a flat (no `/`) ephemeral key for writer scenarios, namespaced by the per-run nonce
+/// and scenario name so concurrent runs, iterations, and scenarios cannot collide, and so
+/// writers don't need to `mkdir` intermediate prefixes through the mount.
+pub fn ephemeral_key(scenario: &str, suffix: &str) -> String {
+    format!("ephemeral_{}_{scenario}_{suffix}", ephemeral_run_id())
+}
+
 /// Return the shared prefix (e.g. `mountpoint-test/shared-stress-test-objects/`).
 fn shared_prefix_string() -> String {
     let base = std::env::var("S3_BUCKET_TEST_PREFIX").unwrap_or_else(|_| String::from("mountpoint-test/"));
     assert!(base.ends_with('/'), "S3_BUCKET_TEST_PREFIX should end in '/'");
     format!("{base}{SHARED_PREFIX_SUFFIX}")
-}
-
-/// An `S3Path` pointing at the shared stress test objects prefix.
-///
-/// Scenarios that mount at this path can read the shared objects by their short key
-/// (`LARGE_OBJECT_KEY`, `small_object_key(i)`), and should namespace any ephemeral writes
-/// so they cannot collide with the shared keys.
-pub fn shared_s3_path() -> S3Path {
-    let bucket = get_test_bucket();
-    let prefix = shared_prefix_string();
-    S3Path::new(Bucket::new(bucket).unwrap(), Prefix::new(&prefix).unwrap())
 }
 
 /// Upload the given `(key, size)` shared test objects if they are not already present at the

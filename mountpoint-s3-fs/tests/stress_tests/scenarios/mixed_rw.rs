@@ -11,12 +11,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
-use mountpoint_s3_fs::s3::S3Path;
 
 use crate::common::fuse::{TestSession, TestSessionConfig};
 use crate::stress_tests::harness::{self, FileOp, FileOpLatencies, Scenario};
 use crate::stress_tests::scenarios::common::read_to_eof_once;
-use crate::stress_tests::test_objects::{self, LARGE_OBJECT_KEY, LARGE_OBJECT_SIZE};
+use crate::stress_tests::test_objects::{self, LARGE_OBJECT_KEY, LARGE_OBJECT_SIZE, SHARED_MOUNT_PREFIX};
 
 const NUM_READERS: usize = 16;
 const NUM_WRITERS: usize = 24;
@@ -37,13 +36,6 @@ impl Scenario for MixedRw {
 
     fn session_config(&self) -> TestSessionConfig {
         TestSessionConfig::default().with_mem_limit(MINIMUM_MEM_LIMIT)
-    }
-
-    fn s3_path_override(&self) -> Option<S3Path> {
-        // Mount at the shared stress test objects prefix so readers can see the shared 100 GiB
-        // test object. Writers must use their own key namespace so they cannot collide with
-        // the shared read object.
-        Some(test_objects::shared_s3_path())
     }
 
     fn setup(&self, _session: &TestSession) {
@@ -72,7 +64,7 @@ fn reader_loop(
     latencies: &mut FileOpLatencies,
     stop: &AtomicBool,
 ) {
-    let path = mount_path.join(LARGE_OBJECT_KEY);
+    let path = mount_path.join(SHARED_MOUNT_PREFIX).join(LARGE_OBJECT_KEY);
     let mut buf = vec![0u8; READ_CHUNK];
     while !stop.load(Ordering::Relaxed) {
         read_to_eof_once("mixed_rw reader", &path, &mut buf, progress, latencies, stop);
@@ -90,13 +82,10 @@ fn writer_loop(
     let mut iter: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         iter += 1;
-        // Namespace writer keys with a per-run nonce so they never collide with shared
-        // test objects or leftover objects from prior runs. Flat (no '/') so we don't need to
-        // mkdir intermediate prefixes through mountpoint.
-        let key = format!(
-            "mixed_rw_ephemeral_{}_w{writer_id:03}_i{iter:06}.bin",
-            test_objects::ephemeral_run_id()
-        );
+        // Flat, per-run-nonced key so writes never collide with shared test objects,
+        // leftover objects from prior runs, or concurrent runs. Flat (no '/') so we don't
+        // need to mkdir intermediate prefixes through mountpoint.
+        let key = test_objects::ephemeral_key("mixed_rw", &format!("w{writer_id:03}_i{iter:06}.bin"));
         let path = mount_path.join(&key);
 
         let mut file = latencies
