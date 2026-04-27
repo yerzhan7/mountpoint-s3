@@ -168,7 +168,6 @@ pub mod stress_recorder {
     pub fn install() {
         RECORDER.get_or_init(|| {
             let recorder = HdrRecorder::default();
-            // Ignore errors: another test binary or ctor may have installed a recorder already.
             let _ = metrics::set_global_recorder(recorder.clone());
             recorder
         });
