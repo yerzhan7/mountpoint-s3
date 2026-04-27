@@ -2,16 +2,15 @@
 //! under the 512 MiB memory limit. Exercises prefetch reservation, window growth, and pruning
 //! interactions under sustained read pressure.
 
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 use mountpoint_s3_fs::s3::S3Path;
 
 use crate::common::fuse::{TestSession, TestSessionConfig};
-use crate::stress_tests::harness::{self, FileOp, Scenario, FileOpLatencies};
+use crate::stress_tests::harness::{self, FileOpLatencies, Scenario};
+use crate::stress_tests::scenarios::common::read_to_eof_once;
 use crate::stress_tests::test_objects::{self, LARGE_OBJECT_KEY, LARGE_OBJECT_SIZE};
 
 const READ_CHUNK: usize = 8 * 1024 * 1024; // 8 MiB — matches default part size
@@ -50,29 +49,8 @@ impl Scenario for SustainedReads {
     ) {
         let path = mount_path.join(LARGE_OBJECT_KEY);
         let mut buf = vec![0u8; READ_CHUNK];
-        while !stop.load(Ordering::Relaxed) {
-            let mut file = latencies
-                .time(FileOp::Open, || File::open(&path))
-                .unwrap_or_else(|e| {
-                    panic!("sustained_reads: open of {path:?} failed: {e:?}");
-                });
-            // Count every successful open as progress too.
-            progress.fetch_add(1, Ordering::Relaxed);
-            loop {
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                let n = latencies
-                    .time(FileOp::Read, || file.read(&mut buf))
-                    .unwrap_or_else(|e| {
-                        panic!("sustained_reads: read of {path:?} failed: {e:?}");
-                    });
-                if n == 0 {
-                    break; // EOF — re-open
-                }
-                progress.fetch_add(n as u64, Ordering::Relaxed);
-            }
-            latencies.time(FileOp::CloseRead, || drop(file));
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            read_to_eof_once("sustained_reads", &path, &mut buf, progress, latencies, stop);
         }
     }
 }

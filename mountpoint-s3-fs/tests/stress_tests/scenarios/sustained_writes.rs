@@ -1,4 +1,4 @@
-//! `sustained_writes`: 48 workers concurrently writing 50-200 MiB objects under the 512 MiB
+//! `sustained_writes`: 48 workers concurrently writing 100 MiB objects under the 512 MiB
 //! memory limit. Sized so the per-part upload reservations stay under the memory budget
 //! (48 workers × 8 MiB part-size = 384 MiB < 512 MiB).
 
@@ -10,12 +10,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 
 use crate::common::fuse::TestSessionConfig;
-use crate::stress_tests::harness::{self, FileOp, Scenario, FileOpLatencies};
+use crate::stress_tests::harness::{self, FileOp, FileOpLatencies, Scenario};
 
 const NUM_WORKERS: usize = 48;
 const WRITE_CHUNK: usize = 8 * 1024 * 1024; // 8 MiB — matches default part size
-const MIN_OBJECT_SIZE: usize = 50 * 1024 * 1024;
-const MAX_OBJECT_SIZE: usize = 200 * 1024 * 1024;
+const OBJECT_SIZE: usize = 100 * 1024 * 1024; // 100 MiB
 
 struct SustainedWrites;
 
@@ -44,7 +43,6 @@ impl Scenario for SustainedWrites {
         let chunk = vec![0xC3u8; WRITE_CHUNK];
         while !stop.load(Ordering::Relaxed) {
             iter += 1;
-            let size = next_size(iter);
             let key = format!("w{worker_id:03}_i{iter:06}.bin");
             let path = mount_path.join(&key);
 
@@ -56,8 +54,8 @@ impl Scenario for SustainedWrites {
             progress.fetch_add(1, Ordering::Relaxed);
 
             let mut written = 0usize;
-            while written < size && !stop.load(Ordering::Relaxed) {
-                let n = (size - written).min(WRITE_CHUNK);
+            while written < OBJECT_SIZE && !stop.load(Ordering::Relaxed) {
+                let n = (OBJECT_SIZE - written).min(WRITE_CHUNK);
                 latencies
                     .time(FileOp::Write, || file.write_all(&chunk[..n]))
                     .unwrap_or_else(|e| {
@@ -72,12 +70,6 @@ impl Scenario for SustainedWrites {
             let _ = std::fs::remove_file(&path);
         }
     }
-}
-
-/// Deterministic pseudo-random size in `[MIN_OBJECT_SIZE, MAX_OBJECT_SIZE]`.
-fn next_size(seed: u64) -> usize {
-    let range = MAX_OBJECT_SIZE - MIN_OBJECT_SIZE;
-    MIN_OBJECT_SIZE + (seed.wrapping_mul(2_654_435_761) as usize) % (range + 1)
 }
 
 #[test]

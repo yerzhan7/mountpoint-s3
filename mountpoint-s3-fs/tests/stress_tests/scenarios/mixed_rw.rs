@@ -6,7 +6,7 @@
 //! headroom (~320 MiB) for the 16 readers' prefetch windows.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -14,8 +14,10 @@ use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 use mountpoint_s3_fs::s3::S3Path;
 
 use crate::common::fuse::{TestSession, TestSessionConfig};
-use crate::stress_tests::harness::{self, FileOp, Scenario, FileOpLatencies};
+use crate::stress_tests::harness::{self, FileOp, FileOpLatencies, Scenario};
+use crate::stress_tests::scenarios::common::read_to_eof_once;
 use crate::stress_tests::test_objects::{self, LARGE_OBJECT_KEY, LARGE_OBJECT_SIZE};
+
 const NUM_READERS: usize = 16;
 const NUM_WRITERS: usize = 24;
 const READ_CHUNK: usize = 8 * 1024 * 1024; // 8 MiB — matches default part size
@@ -57,7 +59,7 @@ impl Scenario for MixedRw {
         stop: &AtomicBool,
     ) {
         if worker_id < NUM_READERS {
-            reader_loop(worker_id, mount_path, progress, latencies, stop);
+            reader_loop(mount_path, progress, latencies, stop);
         } else {
             writer_loop(worker_id - NUM_READERS, mount_path, progress, latencies, stop);
         }
@@ -65,7 +67,6 @@ impl Scenario for MixedRw {
 }
 
 fn reader_loop(
-    reader_id: usize,
     mount_path: &Path,
     progress: &AtomicU64,
     latencies: &mut FileOpLatencies,
@@ -74,28 +75,7 @@ fn reader_loop(
     let path = mount_path.join(LARGE_OBJECT_KEY);
     let mut buf = vec![0u8; READ_CHUNK];
     while !stop.load(Ordering::Relaxed) {
-        let mut file = latencies
-            .time(FileOp::Open, || File::open(&path))
-            .unwrap_or_else(|e| {
-                panic!("mixed_rw: reader {reader_id}: open of {path:?} failed: {e:?}");
-            });
-        // Count every successful open as progress too.
-        progress.fetch_add(1, Ordering::Relaxed);
-        loop {
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            let n = latencies
-                .time(FileOp::Read, || file.read(&mut buf))
-                .unwrap_or_else(|e| {
-                    panic!("mixed_rw: reader {reader_id}: read of {path:?} failed: {e:?}");
-                });
-            if n == 0 {
-                break;
-            }
-            progress.fetch_add(n as u64, Ordering::Relaxed);
-        }
-        latencies.time(FileOp::CloseRead, || drop(file));
+        read_to_eof_once("mixed_rw reader", &path, &mut buf, progress, latencies, stop);
     }
 }
 

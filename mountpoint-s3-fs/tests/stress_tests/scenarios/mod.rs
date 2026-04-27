@@ -2,6 +2,7 @@
 //! and exposes a `#[test] #[ignore]` entry point.
 
 mod churn;
+mod common;
 mod mixed_rw;
 mod smoke;
 mod sustained_reads;
