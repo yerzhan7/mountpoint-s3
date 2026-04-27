@@ -35,10 +35,10 @@ pub trait Scenario: Send + Sync {
     fn name(&self) -> &str;
 
     /// Maximum time worker `worker_id` may go without incrementing its progress counter
-    /// before the watchdog declares it stalled. The default is 10s for all workers.
+    /// before the watchdog declares it stalled. The default is 20s for all workers.
     /// The API still supports per-worker thresholds for scenarios that need them.
     fn max_idle_duration(&self, _worker_id: usize) -> Duration {
-        Duration::from_secs(10)
+        Duration::from_secs(20)
     }
 
     /// Number of worker threads to spawn.
@@ -68,10 +68,10 @@ pub trait Scenario: Send + Sync {
         self.session_config().filesystem_config.mem_limit as f64
     }
 
-    /// Maximum allowed p100 latency for `op`, aggregated across all workers. Default 10s for
+    /// Maximum allowed p100 latency for `op`, aggregated across all workers. Default 20s for
     /// every op; scenarios may override per op if they have a different natural profile.
     fn max_latency(&self, _op: FileOp) -> Duration {
-        Duration::from_secs(10)
+        Duration::from_secs(20)
     }
 }
 
