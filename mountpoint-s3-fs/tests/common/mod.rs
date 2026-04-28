@@ -6,7 +6,7 @@ pub mod cache;
 
 pub mod creds;
 
-#[cfg(feature = "fuse_tests")]
+#[cfg(any(feature = "fuse_tests", feature = "stress_tests"))]
 pub mod fuse;
 
 #[cfg(feature = "s3_tests")]
@@ -156,4 +156,30 @@ fn init_tracing_subscriber() {
 fn init_crt() {
     mountpoint_s3_client::config::io_library_init(&mountpoint_s3_client::config::Allocator::default());
     mountpoint_s3_client::config::s3_library_init(&mountpoint_s3_client::config::Allocator::default());
+}
+
+#[cfg(feature = "stress_tests")]
+pub mod stress_recorder {
+    use super::test_recorder::stress::HdrRecorder;
+    use std::sync::OnceLock;
+
+    static RECORDER: OnceLock<HdrRecorder> = OnceLock::new();
+
+    pub fn install() {
+        RECORDER.get_or_init(|| {
+            let recorder = HdrRecorder::default();
+            let _ = metrics::set_global_recorder(recorder.clone());
+            recorder
+        });
+    }
+
+    pub fn recorder() -> Option<&'static HdrRecorder> {
+        RECORDER.get()
+    }
+}
+
+#[cfg(feature = "stress_tests")]
+#[ctor::ctor]
+fn init_stress_recorder() {
+    stress_recorder::install();
 }

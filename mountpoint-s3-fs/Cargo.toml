@@ -101,6 +101,10 @@ s3_tests = []
 s3express_tests = []
 shuttle = []
 second_account_tests = []
+# Long-running stress tests under tests/stress_tests/. Tests are additionally
+# marked `#[ignore]` so they are skipped by default; run with `--run-ignored only`.
+# See tests/stress_tests/README.md.
+stress_tests = ["s3_tests"]
 
 [[example]]
 name = "mount_from_config"
