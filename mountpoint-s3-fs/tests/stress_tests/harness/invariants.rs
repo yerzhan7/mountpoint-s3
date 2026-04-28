@@ -52,7 +52,7 @@ pub(super) fn assert_peak_reserved_invariant(scenario_name: &str, mem_limit: f64
     let effective_budget = mem_limit_u64.saturating_sub(additional_mem_reserved);
 
     let mut violations: Vec<String> = Vec::new();
-    for (area, metric) in collect_gauges_by_label(&recorder, "mem.bytes_reserved", "area") {
+    for (area, metric) in collect_gauges_by_label(recorder, "mem.bytes_reserved", "area") {
         let peak = metric.gauge_history().max();
         tracing::info!(
             scenario = scenario_name,
@@ -70,7 +70,7 @@ pub(super) fn assert_peak_reserved_invariant(scenario_name: &str, mem_limit: f64
             &mut violations,
         );
     }
-    for (kind, metric) in collect_gauges_by_label(&recorder, "pool.reserved_bytes", "kind") {
+    for (kind, metric) in collect_gauges_by_label(recorder, "pool.reserved_bytes", "kind") {
         let peak = metric.gauge_history().max();
         tracing::info!(
             scenario = scenario_name,
@@ -186,12 +186,12 @@ pub(super) fn assert_teardown_invariants(scenario_name: &str) {
         return;
     };
     let mut leaks: Vec<String> = Vec::new();
-    for (area, metric) in collect_gauges_by_label(&recorder, "mem.bytes_reserved", "area") {
+    for (area, metric) in collect_gauges_by_label(recorder, "mem.bytes_reserved", "area") {
         let v = metric.gauge();
         tracing::info!(scenario = scenario_name, area = %area, value = v, "stress: teardown mem.bytes_reserved");
         check_teardown_leak("mem.bytes_reserved", "area", &area, v, &mut leaks);
     }
-    for (kind, metric) in collect_gauges_by_label(&recorder, "pool.reserved_bytes", "kind") {
+    for (kind, metric) in collect_gauges_by_label(recorder, "pool.reserved_bytes", "kind") {
         let v = metric.gauge();
         tracing::info!(scenario = scenario_name, kind = %kind, value = v, "stress: teardown pool.reserved_bytes");
         check_teardown_leak("pool.reserved_bytes", "kind", &kind, v, &mut leaks);
@@ -231,7 +231,7 @@ pub(super) fn assert_p100_latency(
     let mut violations: Vec<String> = Vec::new();
     for op in FileOp::ALL {
         let h = aggregate.histogram(op);
-        if h.len() == 0 {
+        if h.is_empty() {
             continue;
         }
         let max_us = max_latency(op).as_micros().min(u64::MAX as u128) as u64;
