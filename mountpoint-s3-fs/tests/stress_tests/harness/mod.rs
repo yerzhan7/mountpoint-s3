@@ -1,6 +1,6 @@
 //! Core harness for stress scenarios.
 
-use std::path::Path;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
@@ -8,64 +8,29 @@ use std::time::{Duration, Instant};
 
 use mountpoint_s3_fs::s3::{Bucket, Prefix, S3Path};
 
-use crate::common::fuse::{self, TestSession, TestSessionConfig};
+use crate::common::fuse;
 use crate::common::stress_recorder;
+use crate::stress_tests::test_objects::ensure_shared_objects;
 
 mod invariants;
 mod latency;
 mod memory_monitor;
 mod report;
+mod scenario;
 mod watchdog;
+mod worker;
 use invariants::{
     assert_p100_latency, assert_peak_reserved_invariant, assert_peak_rss_invariant, assert_teardown_invariants,
 };
 pub use latency::{FileOp, FileOpLatencies};
 use memory_monitor::spawn_memory_monitor;
 use report::dump_summary;
+pub use scenario::{Scenario, default_max_latency};
 use watchdog::{NO_STALL, spawn_watchdog};
+pub use worker::Worker;
 
 /// Default scenario duration if `STRESS_DURATION_SECS` is unset.
 const DEFAULT_DURATION_SECS: u64 = 30;
-
-/// A stress-test scenario. Implementations describe a load shape; the harness drives it.
-pub trait Scenario: Send + Sync {
-    /// Short name used for logging and as the S3 test prefix component.
-    fn name(&self) -> &str;
-
-    /// Maximum time worker `worker_id` may go without incrementing its progress counter
-    /// before the watchdog declares it stalled. The default is 20s for all workers.
-    /// The API still supports per-worker thresholds for scenarios that need them.
-    fn max_idle_duration(&self, _worker_id: usize) -> Duration {
-        Duration::from_secs(20)
-    }
-
-    /// Number of worker threads to spawn.
-    fn num_workers(&self) -> usize;
-
-    /// Session configuration for this scenario (memory limit, part size, etc.).
-    fn session_config(&self) -> TestSessionConfig;
-
-    /// One-time setup (e.g. upload test objects). Runs before any worker starts.
-    fn setup(&self, _session: &TestSession) {}
-
-    /// Worker body. Must loop until `stop` is set, incrementing `progress` to signal liveness.
-    /// Time file ops via `latencies.time(op, || ...)` so the harness can aggregate per-op
-    /// latency histograms and assert a p100 ceiling at teardown.
-    fn run_worker(
-        &self,
-        worker_id: usize,
-        mount_path: &Path,
-        progress: &AtomicU64,
-        latencies: &mut FileOpLatencies,
-        stop: &AtomicBool,
-    );
-
-    /// Maximum allowed p100 latency for `op`, aggregated across all workers. Default 20s for
-    /// every op; scenarios may override per op if they have a different natural profile.
-    fn max_latency(&self, _op: FileOp) -> Duration {
-        Duration::from_secs(20)
-    }
-}
 
 /// Return the `S3Path` every stress scenario mounts at: `<S3_BUCKET_NAME>/<S3_BUCKET_TEST_PREFIX>`
 fn stress_mount_s3_path() -> S3Path {
@@ -76,38 +41,55 @@ fn stress_mount_s3_path() -> S3Path {
 }
 
 /// Run the given scenario. Reads `STRESS_DURATION_SECS` from env; default 30s.
-pub fn run<S: Scenario + 'static>(scenario: S) {
+pub fn run(scenario: Scenario) {
     // Make sure the snapshotting recorder is installed even if the common-module ctor has not
     // run yet (nextest uses a fresh process per test).
     stress_recorder::install();
 
     let duration = read_duration_env();
-    let scenario = Arc::new(scenario);
+    let Scenario {
+        name: scenario_name,
+        mut session_config,
+        workers,
+        max_latency,
+    } = scenario;
+
+    let mem_limit = session_config.filesystem_config.mem_limit as f64;
+    let num_workers = workers.len();
+    assert!(
+        num_workers > 0,
+        "scenario {scenario_name:?} must declare at least one worker"
+    );
+
+    // Per-kind instance index (0-based within each kind) and human-readable labels
+    // (`kind#instance`) used in log lines and stall messages.
+    let (instances, labels) = assign_instances_and_labels(&workers);
 
     tracing::info!(
-        scenario = scenario.name(),
+        scenario = scenario_name,
         duration_secs = duration.as_secs(),
-        workers = scenario.num_workers(),
+        workers = num_workers,
         "stress: starting"
     );
 
+    let shared_objects = collect_shared_objects(&workers, scenario_name);
+    let shared_refs: Vec<(&str, usize)> = shared_objects.iter().map(|(k, s)| (k.as_str(), *s)).collect();
+    ensure_shared_objects(&shared_refs);
+
     let session = {
-        let mut config = scenario.session_config();
-        config.filesystem_config.allow_delete = true;
-        config.filesystem_config.allow_overwrite = true;
+        session_config.filesystem_config.allow_delete = true;
+        session_config.filesystem_config.allow_overwrite = true;
         let s3_path = stress_mount_s3_path();
         let region = crate::common::s3::get_test_region();
         let sdk_client = crate::common::tokio_block_on(async { crate::common::s3::get_test_sdk_client(&region).await });
-        fuse::s3_session::new_with_test_client(config, sdk_client, s3_path)
+        fuse::s3_session::new_with_test_client(session_config, sdk_client, s3_path)
     };
-    scenario.setup(&session);
 
-    let num_workers = scenario.num_workers();
     let stop = Arc::new(AtomicBool::new(false));
     let progress: Vec<Arc<AtomicU64>> = (0..num_workers).map(|_| Arc::new(AtomicU64::new(0))).collect();
     let stalled_worker = Arc::new(AtomicUsize::new(NO_STALL));
 
-    let max_idles: Vec<Duration> = (0..num_workers).map(|i| scenario.max_idle_duration(i)).collect();
+    let max_idles: Vec<Duration> = workers.iter().map(|w| w.max_idle()).collect();
     let max_join_wait = max_idles
         .iter()
         .copied()
@@ -116,21 +98,23 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
 
     let mount_path: std::path::PathBuf = session.mount_path().to_path_buf();
     let mut handles: Vec<thread::JoinHandle<FileOpLatencies>> = Vec::with_capacity(num_workers);
-    for worker_id in 0..num_workers {
-        let scenario = scenario.clone();
+    for (worker_id, worker) in workers.iter().enumerate() {
+        let worker = Arc::clone(worker);
         let stop = stop.clone();
         let progress = progress[worker_id].clone();
         let mount_path = mount_path.clone();
+        let instance = instances[worker_id];
         handles.push(thread::spawn(move || {
             let mut latencies = FileOpLatencies::new();
-            scenario.run_worker(worker_id, &mount_path, &progress, &mut latencies, &stop);
+            worker.run(instance, &mount_path, &progress, &mut latencies, &stop);
             latencies
         }));
     }
 
     let watchdog = spawn_watchdog(
-        scenario.name().to_string(),
-        max_idles,
+        scenario_name.to_string(),
+        labels.clone(),
+        max_idles.clone(),
         progress.clone(),
         stop.clone(),
         stalled_worker.clone(),
@@ -153,14 +137,14 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
     // are wedged in a kernel FUSE syscall they cannot observe `stop` and `JoinHandle` has
     // no timeout API, so we poll `is_finished()` up to a deadline. On timeout we drop
     // (unmount) the session to force EIO/EINTR on stuck syscalls, then panic with the
-    // stuck worker IDs.
+    // stuck worker labels.
     let join_deadline = Instant::now() + max_join_wait;
     while !handles.iter().all(|h| h.is_finished()) {
         if Instant::now() >= join_deadline {
-            let stuck: Vec<usize> = handles
+            let stuck: Vec<&str> = handles
                 .iter()
                 .enumerate()
-                .filter_map(|(id, h)| (!h.is_finished()).then_some(id))
+                .filter_map(|(id, h)| (!h.is_finished()).then_some(labels[id].as_str()))
                 .collect();
             drop(session);
             panic!("stress: workers {stuck:?} did not finish within {max_join_wait:?} after stop");
@@ -170,7 +154,9 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
 
     let mut aggregate = FileOpLatencies::new();
     for (id, handle) in handles.into_iter().enumerate() {
-        let rec = handle.join().unwrap_or_else(|e| panic!("worker {id} panicked: {e:?}"));
+        let rec = handle
+            .join()
+            .unwrap_or_else(|e| panic!("worker {} panicked: {e:?}", labels[id]));
         aggregate.merge(&rec);
     }
 
@@ -179,24 +165,65 @@ pub fn run<S: Scenario + 'static>(scenario: S) {
     let stalled = stalled_worker.load(Ordering::SeqCst);
     if stalled != NO_STALL {
         panic!(
-            "stress: scenario {:?} failed: worker {stalled} stalled for at least {:?}",
-            scenario.name(),
-            scenario.max_idle_duration(stalled),
+            "stress: scenario {scenario_name:?} failed: worker {} stalled for at least {:?}",
+            labels[stalled], max_idles[stalled],
         );
     }
 
-    dump_summary(scenario.name(), &aggregate);
+    dump_summary(scenario_name, &aggregate);
 
     tracing::info!("");
-    tracing::info!("=== STRESS [{}] INVARIANT ASSERTIONS ===", scenario.name());
-    let mem_limit = scenario.session_config().filesystem_config.mem_limit as f64;
-    assert_peak_reserved_invariant(scenario.name(), mem_limit);
-    assert_peak_rss_invariant(scenario.name(), mem_limit);
-    assert_teardown_invariants(scenario.name());
-    assert_p100_latency(scenario.name(), &aggregate, |op| scenario.max_latency(op));
+    tracing::info!("=== STRESS [{}] INVARIANT ASSERTIONS ===", scenario_name);
+    assert_peak_reserved_invariant(scenario_name, mem_limit);
+    assert_peak_rss_invariant(scenario_name, mem_limit);
+    assert_teardown_invariants(scenario_name);
+    assert_p100_latency(scenario_name, &aggregate, max_latency);
     tracing::info!("");
 
-    tracing::info!(scenario = scenario.name(), "stress: finished");
+    tracing::info!(scenario = scenario_name, "stress: finished");
+}
+
+/// Compute, for each worker, its 0-based instance index within its kind, along with a
+/// `kind#instance` label used in logs and stall messages.
+fn assign_instances_and_labels(workers: &[Arc<dyn Worker>]) -> (Vec<usize>, Vec<String>) {
+    let mut counts: HashMap<&'static str, usize> = HashMap::new();
+    let mut instances = Vec::with_capacity(workers.len());
+    let mut labels = Vec::with_capacity(workers.len());
+    for w in workers {
+        let kind = w.kind();
+        let instance = *counts.entry(kind).and_modify(|c| *c += 1).or_insert(0);
+        labels.push(format!("{kind}#{instance}"));
+        instances.push(instance);
+    }
+    (instances, labels)
+}
+
+/// Union every worker's shared-objects manifest and de-dupe by key. If two workers
+/// declare the same key with different sizes, panic with a clear message — that's a
+/// scenario bug, not a runtime error we should paper over.
+///
+/// Returns the manifest.
+fn collect_shared_objects(workers: &[Arc<dyn Worker>], scenario_name: &str) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for w in workers {
+        for (key, size) in w.shared_objects() {
+            match seen.get(&key) {
+                Some(&existing_size) => {
+                    assert_eq!(
+                        existing_size, size,
+                        "stress: scenario {scenario_name:?} has conflicting declarations for shared object {key:?}: \
+                         {existing_size} vs {size}"
+                    );
+                }
+                None => {
+                    seen.insert(key.clone(), size);
+                    out.push((key, size));
+                }
+            }
+        }
+    }
+    out
 }
 
 fn read_duration_env() -> Duration {

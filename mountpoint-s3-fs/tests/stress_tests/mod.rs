@@ -3,3 +3,4 @@
 mod harness;
 mod scenarios;
 mod test_objects;
+mod workers;

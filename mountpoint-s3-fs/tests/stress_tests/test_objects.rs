@@ -6,7 +6,10 @@
 //! They are never deleted — multiple stress runs reuse the same objects to avoid paying the upload cost on every run.
 //!
 //! Scenarios mount at the `<S3_BUCKET_TEST_PREFIX>` root and read shared objects via the
-//! `shared-stress-test-objects/<key>` relative path under the mount.
+//! `shared-stress-test-objects/<key>` relative path under the mount. Per-worker object
+//! identities (which keys at which sizes) live with the workers that consume them —
+//! e.g. `LARGE_OBJECT_KEY` in `workers/sequential_reader.rs`, the small-object pool in
+//! `workers/common.rs`.
 
 use std::sync::Arc;
 
@@ -24,24 +27,6 @@ use crate::common::tokio_block_on;
 
 /// Stable path segment for shared stress test objects.
 pub const SHARED_OBJECTS_PREFIX: &str = "shared-stress-test-objects/";
-
-/// Key (inside the shared prefix) for the large read object used by `sustained_reads`
-/// and `mixed_rw`.
-pub const LARGE_OBJECT_KEY: &str = "read_100gib.bin";
-
-/// Size of the shared large read object (100 GiB).
-pub const LARGE_OBJECT_SIZE: usize = 100 * 1024 * 1024 * 1024;
-
-/// Number of small shared objects used by `churn`.
-pub const SMALL_SET_COUNT: usize = 100;
-
-/// Size of each small shared object.
-pub const SMALL_SET_SIZE: usize = 128 * 1024;
-
-/// Key format for entries in the shared small-object set used by `churn`.
-pub fn small_object_key(index: usize) -> String {
-    format!("small_{index:04}.bin")
-}
 
 /// A process-wide, per-run nonce for ephemeral writer keys.
 pub fn ephemeral_run_id() -> &'static str {

@@ -1,6 +1,6 @@
 //! Stall-detection watchdog. Runs on its own thread, watches per-worker progress counters,
-//! and flags the first worker that goes longer than its per-worker `max_idle_duration`
-//! without advancing.
+//! and flags the first worker that goes longer than its per-worker `max_idle` without
+//! advancing.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -15,6 +15,7 @@ pub(super) const NO_STALL: usize = usize::MAX;
 
 pub(super) fn spawn_watchdog(
     scenario_name: String,
+    labels: Vec<String>,
     max_idle_per_worker: Vec<Duration>,
     progress: Vec<Arc<AtomicU64>>,
     stop: Arc<AtomicBool>,
@@ -33,14 +34,14 @@ pub(super) fn spawn_watchdog(
                     last_progress[id] = current;
                     last_advance[id] = now;
                 } else if now.duration_since(last_advance[id]) >= max_idle_per_worker[id] {
-                    let snapshot: Vec<(usize, u64)> = progress
+                    let snapshot: Vec<(&str, u64)> = progress
                         .iter()
                         .enumerate()
-                        .map(|(i, p)| (i, p.load(Ordering::Relaxed)))
+                        .map(|(i, p)| (labels[i].as_str(), p.load(Ordering::Relaxed)))
                         .collect();
                     tracing::error!(
                         scenario = %scenario_name,
-                        stalled_worker = id,
+                        stalled_worker = %labels[id],
                         max_idle_secs = max_idle_per_worker[id].as_secs(),
                         ?snapshot,
                         "stress: worker stalled — per-worker progress snapshot"

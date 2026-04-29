@@ -1,17 +1,14 @@
 //! `mixed_rw`: 16 readers + 24 writers sharing the same session under the 512 MiB memory
 //! limit.
 
-use std::fs::File;
-use std::io::Write;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::iter::{chain, repeat_n};
+use std::sync::Arc;
 
 use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 
-use crate::common::fuse::{TestSession, TestSessionConfig};
-use crate::stress_tests::harness::{self, FileOp, FileOpLatencies, Scenario};
-use crate::stress_tests::scenarios::common::read_to_eof_once;
-use crate::stress_tests::test_objects::{self, LARGE_OBJECT_KEY, LARGE_OBJECT_SIZE, SHARED_OBJECTS_PREFIX};
+use crate::common::fuse::TestSessionConfig;
+use crate::stress_tests::harness::{self, Scenario, Worker, default_max_latency};
+use crate::stress_tests::workers::{LARGE_READ_OBJECT, SequentialReader, Writer};
 
 const NUM_READERS: usize = 16;
 const NUM_WRITERS: usize = 24;
@@ -19,96 +16,23 @@ const READ_CHUNK: usize = 8 * 1024 * 1024; // 8 MiB — matches default part siz
 const WRITE_CHUNK: usize = 8 * 1024 * 1024; // 8 MiB — matches default part size
 const WRITE_OBJECT_SIZE: usize = 100 * 1024 * 1024; // 100 MiB
 
-struct MixedRw;
-
-impl Scenario for MixedRw {
-    fn name(&self) -> &str {
-        "mixed_rw"
-    }
-
-    fn num_workers(&self) -> usize {
-        NUM_READERS + NUM_WRITERS
-    }
-
-    fn session_config(&self) -> TestSessionConfig {
-        TestSessionConfig::default().with_mem_limit(MINIMUM_MEM_LIMIT)
-    }
-
-    fn setup(&self, _session: &TestSession) {
-        test_objects::ensure_shared_objects(&[(LARGE_OBJECT_KEY, LARGE_OBJECT_SIZE)]);
-    }
-
-    fn run_worker(
-        &self,
-        worker_id: usize,
-        mount_path: &Path,
-        progress: &AtomicU64,
-        latencies: &mut FileOpLatencies,
-        stop: &AtomicBool,
-    ) {
-        if worker_id < NUM_READERS {
-            reader_loop(mount_path, progress, latencies, stop);
-        } else {
-            writer_loop(worker_id - NUM_READERS, mount_path, progress, latencies, stop);
-        }
-    }
-}
-
-fn reader_loop(mount_path: &Path, progress: &AtomicU64, latencies: &mut FileOpLatencies, stop: &AtomicBool) {
-    let path = mount_path.join(SHARED_OBJECTS_PREFIX).join(LARGE_OBJECT_KEY);
-    let mut buf = vec![0u8; READ_CHUNK];
-    while !stop.load(Ordering::Relaxed) {
-        read_to_eof_once("mixed_rw reader", &path, &mut buf, progress, latencies, stop);
-    }
-}
-
-fn writer_loop(
-    writer_id: usize,
-    mount_path: &Path,
-    progress: &AtomicU64,
-    latencies: &mut FileOpLatencies,
-    stop: &AtomicBool,
-) {
-    let chunk = vec![0xC3u8; WRITE_CHUNK];
-    let mut iter: u64 = 0;
-    while !stop.load(Ordering::Relaxed) {
-        iter += 1;
-        let key = test_objects::ephemeral_key("mixed_rw", &format!("w{writer_id:03}_i{iter:06}.bin"));
-        let path = mount_path.join(&key);
-
-        let mut file = latencies
-            .time(FileOp::Open, || File::create(&path))
-            .unwrap_or_else(|e| {
-                panic!("mixed_rw: writer {writer_id}: create failed: {e:?}");
-            });
-        progress.fetch_add(1, Ordering::Relaxed);
-
-        let mut written = 0usize;
-        while written < WRITE_OBJECT_SIZE && !stop.load(Ordering::Relaxed) {
-            let n = (WRITE_OBJECT_SIZE - written).min(WRITE_CHUNK);
-            latencies
-                .time(FileOp::Write, || file.write_all(&chunk[..n]))
-                .unwrap_or_else(|e| {
-                    panic!("mixed_rw: writer {writer_id}: write failed: {e:?}");
-                });
-            written += n;
-            progress.fetch_add(n as u64, Ordering::Relaxed);
-        }
-        // `sync_all` (not implicit `drop`) so MPU-complete errors surface — `Drop for File`
-        // swallows the `close(2)` return value.
-        latencies
-            .time(FileOp::CloseWrite, || file.sync_all())
-            .unwrap_or_else(|e| {
-                panic!("mixed_rw: writer {writer_id}: sync_all failed: {e:?}");
-            });
-        drop(file);
-        progress.fetch_add(1, Ordering::Relaxed);
-        let _ = std::fs::remove_file(&path);
-    }
-}
-
 #[test]
 #[ignore = "stress test; run with --run-ignored only"]
 fn mixed_rw() {
-    harness::run(MixedRw);
+    let reader: Arc<dyn Worker> = Arc::new(SequentialReader {
+        target: LARGE_READ_OBJECT,
+        chunk: READ_CHUNK,
+    });
+    let writer: Arc<dyn Worker> = Arc::new(Writer {
+        scope: "mixed_rw",
+        object_size: WRITE_OBJECT_SIZE,
+        chunk: WRITE_CHUNK,
+    });
+    let workers = chain(repeat_n(reader, NUM_READERS), repeat_n(writer, NUM_WRITERS)).collect();
+    harness::run(Scenario {
+        name: "mixed_rw",
+        session_config: TestSessionConfig::default().with_mem_limit(MINIMUM_MEM_LIMIT),
+        workers,
+        max_latency: default_max_latency,
+    });
 }

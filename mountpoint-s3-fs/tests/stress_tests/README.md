@@ -7,7 +7,7 @@ deadlocks, per-worker stalls, tail-latency regressions, and memory issues.
 
 - No file I/O errors.
 - Aggregated per file I/O p100 latency is within `Scenario::max_latency(op)`.
-- No per-worker stall longer than `Scenario::max_idle_duration(worker_id)`.
+- No worker stall longer than `Worker::max_idle()`.
 - At teardown, every reservation gauge is back to zero — for each label of
   `mem.bytes_reserved{area=*}` and `pool.reserved_bytes{kind=*}`.
 
@@ -50,27 +50,60 @@ cargo nextest run --release \
 
 ## Adding a new scenario
 
-1. Create `tests/stress_tests/scenarios/my_scenario.rs`.
-2. Implement `crate::stress_tests::harness::Scenario`: at minimum `name`,
-   `num_workers`, `session_config`, and `run_worker`. Override
-   `max_idle_duration`, `max_latency`, and `setup` only if the defaults
-   don't fit.
-3. In `run_worker`, wrap every file-system operation in
+1. Pick the workers that describe the load. Reuse existing ones
+   (`SequentialReader`, `Writer`, `Idle`, `Churn`) or add a new type under
+   `tests/stress_tests/workers/`.
+2. Create `tests/stress_tests/scenarios/my_scenario.rs` containing one
+   `#[test] #[ignore = "stress test; run with --run-ignored only"]`
+   function that:
+   - Builds a `Vec<Arc<dyn Worker>>` using `repeat_n` / `chain` /
+     `repeat_with` as needed.
+   - Builds a `Scenario` value (name, session config, workers,
+     `max_latency`).
+   - Calls `harness::run(scenario)`.
+3. Register the module in `tests/stress_tests/scenarios/mod.rs`.
+
+## Adding a new worker kind
+
+1. Create `tests/stress_tests/workers/my_worker.rs` with a
+   `struct MyWorker { ... }` implementing `Worker`.
+2. In `run`, wrap every file-system operation in
    `latencies.time(FileOp::_, || ...)` so the harness can aggregate per-op
    latency distributions. Use `FileOp::CloseRead` / `FileOp::CloseWrite`
    depending on the handle mode.
-4. For shared read inputs, call
-   `test_objects::ensure_shared_objects(&[(key, size)])` from `setup()` and
-   open the file through the mount at
+3. For shared read inputs, prefer the dataset descriptors in
+   `workers/common.rs`:
+   - `SharedObject { key, size }` for a single pre-uploaded object.
+   - `SharedObjectPool { key_prefix, count, size }` for a family of
+     identically-sized keys; `pool.key(i)` returns the key of entry `i`,
+     and `pool.manifest()` returns the `(key, size)` entries for every
+     key in the pool.
+   Store the descriptor as a field on the worker and derive
+   `shared_objects()` from it:
+   ```rust
+   pub struct MyReader {
+       pub target: SharedObject,
+   }
+
+   impl Worker for MyReader {
+       fn shared_objects(&self) -> Vec<(String, usize)> {
+           vec![(self.target.key.to_string(), self.target.size)]
+       }
+       // ...
+   }
+   ```
+   The harness unions the manifest across every worker in the scenario,
+   de-dupes by key (asserting any two entries agree on size), and calls
+   `ensure_shared_objects` exactly once before spawning threads. It's fine
+   for two worker kinds (e.g. `Idle` and `Churn`) to declare overlapping
+   sets — they'll be collapsed to a single upload pass. Open the file
+   through the mount at
    `mount_path.join(test_objects::SHARED_OBJECTS_PREFIX).join(key)`. For
-   ephemeral writes, use `test_objects::ephemeral_key(scenario, suffix)` to
+   ephemeral writes, use `test_objects::ephemeral_key(scope, suffix)` to
    get a flat, per-run-nonced key that cannot collide with shared objects,
    prior runs, or concurrent runs.
-5. Add a `#[test] #[ignore = "stress test; run with --run-ignored only"]`
-   entry point that calls `harness::run(MyScenario)`.
-6. Register the module in `tests/stress_tests/scenarios/mod.rs`.
-
-Worker bodies must increment the `progress` counter frequently (the watchdog
-polls it) and must check `stop.load(Ordering::Relaxed)` between ops. They
-should panic on I/O errors — scenarios are sized so the operations always
-succeed against a healthy session.
+4. Increment the `progress` counter frequently (the watchdog polls it) and
+   check `stop.load(Ordering::Relaxed)` between ops. Panic on I/O errors —
+   scenarios are sized so the operations always succeed against a healthy
+   session.
+5. Re-export the type from `tests/stress_tests/workers/mod.rs`.
