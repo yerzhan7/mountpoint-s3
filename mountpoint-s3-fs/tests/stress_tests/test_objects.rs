@@ -61,9 +61,13 @@ pub fn ensure_shared_objects(objects: &[(&str, usize)]) {
     }
     let max_size = objects.iter().map(|(_, s)| *s).max().unwrap_or(0);
     let (uploader, bucket, part_size) = build_test_object_uploader(max_size);
-    for (key, size) in objects {
-        upload_test_object_with_uploader(&uploader, &bucket, part_size, key, *size);
-    }
+    let region = get_test_region();
+    tokio_block_on(async {
+        let sdk_client: Client = get_test_sdk_client(&region).await;
+        for (key, size) in objects {
+            upload_test_object_with_uploader(&uploader, &sdk_client, &bucket, part_size, key, *size).await;
+        }
+    });
 }
 
 async fn head_object_size(client: &Client, bucket: &str, key: &str) -> Option<usize> {
@@ -114,20 +118,16 @@ fn build_test_object_uploader(max_object_size: usize) -> (Uploader<S3CrtClient>,
 }
 
 /// HEAD-skip-if-size-matches, else stream-upload a shared test object.
-fn upload_test_object_with_uploader(
+async fn upload_test_object_with_uploader(
     uploader: &Uploader<S3CrtClient>,
+    sdk_client: &Client,
     bucket: &str,
     part_size: usize,
     key: &str,
     size: usize,
 ) {
     let full_key = format!("{}{}", shared_prefix_string(), key);
-    let region = get_test_region();
-    let present = tokio_block_on(async {
-        let client: Client = get_test_sdk_client(&region).await;
-        head_object_size(&client, bucket, &full_key).await == Some(size)
-    });
-    if present {
+    if head_object_size(sdk_client, bucket, &full_key).await == Some(size) {
         tracing::debug!(bucket, key = %full_key, "stress: shared test object already present");
         return;
     }
@@ -140,26 +140,24 @@ fn upload_test_object_with_uploader(
         "stress: uploading shared test object"
     );
 
-    tokio_block_on(async {
-        let mut request = uploader
-            .start_atomic_upload(bucket.to_string(), full_key.clone())
-            .unwrap_or_else(|e| panic!("failed to start MPU for s3://{bucket}/{full_key}: {e:?}"));
+    let mut request = uploader
+        .start_atomic_upload(bucket.to_string(), full_key.clone())
+        .unwrap_or_else(|e| panic!("failed to start MPU for s3://{bucket}/{full_key}: {e:?}"));
 
-        let buf = vec![TEST_OBJECT_FILL_BYTE; part_size];
-        let mut offset = 0u64;
-        while offset < size as u64 {
-            let remaining = size as u64 - offset;
-            let chunk = remaining.min(part_size as u64) as usize;
-            let written = request
-                .write(offset as i64, &buf[..chunk])
-                .await
-                .unwrap_or_else(|e| panic!("write failed at offset {offset} for s3://{bucket}/{full_key}: {e:?}"));
-            offset += written as u64;
-        }
-
-        request
-            .complete()
+    let buf = vec![TEST_OBJECT_FILL_BYTE; part_size];
+    let mut offset = 0u64;
+    while offset < size as u64 {
+        let remaining = size as u64 - offset;
+        let chunk = remaining.min(part_size as u64) as usize;
+        let written = request
+            .write(offset as i64, &buf[..chunk])
             .await
-            .unwrap_or_else(|e| panic!("failed to complete MPU for s3://{bucket}/{full_key}: {e:?}"));
-    });
+            .unwrap_or_else(|e| panic!("write failed at offset {offset} for s3://{bucket}/{full_key}: {e:?}"));
+        offset += written as u64;
+    }
+
+    request
+        .complete()
+        .await
+        .unwrap_or_else(|e| panic!("failed to complete MPU for s3://{bucket}/{full_key}: {e:?}"));
 }
