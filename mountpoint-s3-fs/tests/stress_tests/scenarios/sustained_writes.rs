@@ -15,7 +15,6 @@ const WRITE_CHUNK: usize = 8 * 1024 * 1024; // 8 MiB — matches default part si
 const OBJECT_SIZE: usize = 100 * 1024 * 1024; // 100 MiB
 
 #[test]
-#[ignore = "stress test; run with --run-ignored only"]
 fn sustained_writes() {
     let writer: Arc<dyn Worker> = Arc::new(Writer {
         scope: "sustained_writes",

@@ -23,10 +23,6 @@ deadlocks, per-worker stalls, tail-latency regressions, and memory issues.
 
 ## How to run
 
-The `stress_tests` feature transitively enables `s3_tests`, so no extra
-feature flag is needed. Tests are `#[ignore]` by default — always pass
-`--run-ignored only`.
-
 A single scenario:
 
 ```
@@ -34,7 +30,7 @@ cargo nextest run --release \
     --features stress_tests \
     --package mountpoint-s3-fs \
     'stress_tests::scenarios::sustained_reads' \
-    --run-ignored only --success-output final --failure-output final
+    --success-output final --failure-output final
 ```
 
 All scenarios sequentially:
@@ -44,7 +40,7 @@ cargo nextest run --release \
     --features stress_tests \
     --package mountpoint-s3-fs \
     'stress_tests::' \
-    --run-ignored only --test-threads=1 \
+    --test-threads=1 \
     --success-output final --failure-output final
 ```
 
@@ -54,8 +50,7 @@ cargo nextest run --release \
    (`SequentialReader`, `Writer`, `Idle`, `Churn`) or add a new type under
    `tests/stress_tests/workers/`.
 2. Create `tests/stress_tests/scenarios/my_scenario.rs` containing one
-   `#[test] #[ignore = "stress test; run with --run-ignored only"]`
-   function that:
+   `#[test]` function that:
    - Builds a `Vec<Arc<dyn Worker>>` using `repeat_n` / `chain` /
      `repeat_with` as needed.
    - Builds a `Scenario` value (name, session config, workers,

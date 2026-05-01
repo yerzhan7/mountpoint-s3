@@ -14,7 +14,6 @@ const READ_CHUNK: usize = 8 * 1024 * 1024; // 8 MiB — matches default part siz
 const NUM_WORKERS: usize = 32;
 
 #[test]
-#[ignore = "stress test; run with --run-ignored only"]
 fn sustained_reads() {
     let reader: Arc<dyn Worker> = Arc::new(SequentialReader {
         target: LARGE_READ_OBJECT,

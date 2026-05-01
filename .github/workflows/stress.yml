@@ -82,7 +82,6 @@ jobs:
             --package mountpoint-s3-fs \
             --features stress_tests \
             --test-threads=1 \
-            --run-ignored only \
             --success-output final \
             --failure-output final \
             'stress_tests::scenarios::${{ matrix.scenario }}'

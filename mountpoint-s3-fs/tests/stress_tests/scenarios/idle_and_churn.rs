@@ -15,7 +15,6 @@ const NUM_CHURN_WORKERS: usize = 48;
 const NUM_IDLE_WORKERS: usize = 8;
 
 #[test]
-#[ignore = "stress test; run with --run-ignored only"]
 fn idle_and_churn() {
     let churn: Arc<dyn Worker> = Arc::new(Churn { pool: SMALL_OBJECT_POOL });
     let idle: Arc<dyn Worker> = Arc::new(Idle { pool: SMALL_OBJECT_POOL });
