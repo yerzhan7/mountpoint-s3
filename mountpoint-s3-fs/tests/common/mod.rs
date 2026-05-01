@@ -166,11 +166,14 @@ pub mod stress_recorder {
     static RECORDER: OnceLock<HdrRecorder> = OnceLock::new();
 
     pub fn install() {
-        RECORDER.get_or_init(|| {
-            let recorder = HdrRecorder::default();
-            let _ = metrics::set_global_recorder(recorder.clone());
-            recorder
-        });
+        let recorder = HdrRecorder::default();
+        RECORDER
+            .set(recorder.clone())
+            .map_err(|_| ())
+            .expect("stress_recorder::install() called more than once in this process");
+        metrics::set_global_recorder(recorder)
+            .map_err(|_| ())
+            .expect("a `metrics` global recorder was already installed in this process");
     }
 
     pub fn recorder() -> Option<&'static HdrRecorder> {
