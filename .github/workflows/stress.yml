@@ -23,7 +23,7 @@ env:
   # the end-of-run tracing dump visible while suppressing CRT warn/error noise
   # (credential-chain probes, 404 heads, CRT ERROR on recoverable conditions) that would
   # dominate a long run's CI log without signaling a real failure.
-  RUST_LOG: "warn,r#mod=info,awscrt=off"
+  RUST_LOG: "warn,stress_tests=info,awscrt=off"
   S3_BUCKET_NAME: ${{ vars.S3_BENCH_BUCKET_NAME }}
   S3_BUCKET_TEST_PREFIX: ${{ vars.S3_BUCKET_BENCH_PREFIX || 'mountpoint-benchmark/' }}
   S3_ENDPOINT_URL: ${{ vars.S3_BENCH_ENDPOINT_URL }}
