@@ -42,8 +42,6 @@ fn stress_mount_s3_path() -> S3Path {
 
 /// Run the given scenario. Reads `STRESS_DURATION_SECS` from env; default 30s.
 pub fn run(scenario: Scenario) {
-    // Make sure the snapshotting recorder is installed even if the common-module ctor has not
-    // run yet (nextest uses a fresh process per test).
     stress_recorder::install();
 
     let duration = read_duration_env();

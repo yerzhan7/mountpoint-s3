@@ -177,9 +177,3 @@ pub mod stress_recorder {
         RECORDER.get()
     }
 }
-
-#[cfg(feature = "stress_tests")]
-#[ctor::ctor]
-fn init_stress_recorder() {
-    stress_recorder::install();
-}
