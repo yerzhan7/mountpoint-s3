@@ -39,7 +39,7 @@ fn collect_gauges_by_label(
 
 /// Assert each individual reserved-memory gauge stayed below the effective budget the
 /// limiter enforces against (`mem_limit - additional_mem_reserved`)
-pub(super) fn assert_peak_reserved_invariant(scenario_name: &str, mem_limit: f64) {
+pub fn assert_peak_reserved_invariant(scenario_name: &str, mem_limit: f64) {
     let Some(recorder) = stress_recorder::recorder() else {
         tracing::warn!(
             scenario = scenario_name,
@@ -127,7 +127,7 @@ fn check_peak_violation(
 
 /// Assert the peak sampled `process.memory_usage` (OS-reported RSS) stayed under
 /// `ceiling_bytes`.
-pub(super) fn assert_peak_rss_invariant(scenario_name: &str, ceiling_bytes: f64) {
+pub fn assert_peak_rss_invariant(scenario_name: &str, ceiling_bytes: f64) {
     let Some(recorder) = stress_recorder::recorder() else {
         tracing::warn!(
             scenario = scenario_name,
@@ -177,7 +177,7 @@ pub(super) fn assert_peak_rss_invariant(scenario_name: &str, ceiling_bytes: f64)
 }
 
 /// After the session is dropped, every reservation-tracking gauge must be back to zero.
-pub(super) fn assert_teardown_invariants(scenario_name: &str) {
+pub fn assert_teardown_invariants(scenario_name: &str) {
     let Some(recorder) = stress_recorder::recorder() else {
         tracing::warn!(
             scenario = scenario_name,
@@ -223,7 +223,7 @@ fn check_teardown_leak(metric_name: &str, label_key: &str, label_value: &str, v:
 }
 
 /// Assert that the merged per-op p100 latency is within `max_latency(op)`.
-pub(super) fn assert_p100_latency(
+pub fn assert_p100_latency(
     scenario_name: &str,
     aggregate: &FileOpLatencies,
     max_latency: impl Fn(FileOp) -> Duration,
