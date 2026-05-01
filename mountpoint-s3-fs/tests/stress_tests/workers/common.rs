@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::stress_tests::harness::{FileOp, FileOpLatencies};
+use crate::harness::{FileOp, FileOpLatencies};
 
 /// A single pre-uploaded shared object: the key (relative to `SHARED_OBJECTS_PREFIX`)
 /// and its expected size in bytes.

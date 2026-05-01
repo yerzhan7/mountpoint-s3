@@ -8,8 +8,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::stress_tests::harness::{FileOp, FileOpLatencies, Worker};
-use crate::stress_tests::test_objects::SHARED_OBJECTS_PREFIX;
+use crate::harness::{FileOp, FileOpLatencies, Worker};
+use crate::test_objects::SHARED_OBJECTS_PREFIX;
 
 use super::churn::pick_index;
 use super::common::SharedObjectPool;
