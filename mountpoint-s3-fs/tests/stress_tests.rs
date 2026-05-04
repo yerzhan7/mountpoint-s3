@@ -4,11 +4,11 @@
 #[path = "common/mod.rs"]
 mod common;
 
-#[path = "stress_tests/harness/mod.rs"]
-mod harness;
-#[path = "stress_tests/scenarios/mod.rs"]
-mod scenarios;
-#[path = "stress_tests/test_objects.rs"]
-mod test_objects;
-#[path = "stress_tests/workers/mod.rs"]
-mod workers;
+#[path = "stress_tests"]
+mod _stress_tests {
+    pub mod harness;
+    pub mod scenarios;
+    pub mod test_objects;
+    pub mod workers;
+}
+use _stress_tests::{harness, test_objects, workers};
