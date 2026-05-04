@@ -45,7 +45,7 @@ impl SharedObjectPool {
 pub const SMALL_OBJECT_POOL: SharedObjectPool = SharedObjectPool {
     key_prefix: "small_",
     count: 100,
-    size: 128 * 1024,
+    size: 4 * 1024 * 1024,
 };
 
 /// Open `path`, read it front-to-back into `buf`, close. Increments `progress` on every

@@ -1,6 +1,9 @@
-//! `idle_and_churn`: 48 churn workers + 8 idle workers against a small-object pool under
-//! the 512 MiB memory limit. Exercises short-lived handles concurrently with handles held
-//! idle long enough to retain prefetcher reservations.
+//! `idle_and_churn`: 8 churn workers + 48 idle workers against a shared-object
+//! pool under the 512 MiB memory limit. The idle workers each read enough of the
+//! object to force the prefetcher to issue a second `GetObject` metarequest and then
+//! hold the handle idle for ~60s. The churn workers concurrently open, drain, and 
+//! close handles to verify active readers are not starved by memory pinned behind 
+//! idle handles.
 
 use std::iter::{chain, repeat_n};
 use std::sync::Arc;
@@ -11,8 +14,8 @@ use crate::common::fuse::TestSessionConfig;
 use crate::harness::{self, Scenario, Worker, default_max_latency};
 use crate::workers::{Churn, Idle, SMALL_OBJECT_POOL};
 
-const NUM_CHURN_WORKERS: usize = 48;
-const NUM_IDLE_WORKERS: usize = 8;
+const NUM_CHURN_WORKERS: usize = 8;
+const NUM_IDLE_WORKERS: usize = 48;
 
 #[test]
 fn idle_and_churn() {
