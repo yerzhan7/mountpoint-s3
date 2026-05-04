@@ -233,11 +233,7 @@ fn check_teardown_leak(metric_name: &str, label_key: &str, label_value: &str, v:
 }
 
 /// Assert that the merged per-op p100 latency is within `max_latency(op)`.
-pub fn assert_p100_latency(
-    scenario_name: &str,
-    aggregate: &FileOpLatencies,
-    max_latency: impl Fn(FileOp) -> Duration,
-) {
+pub fn assert_p100_latency(scenario_name: &str, aggregate: &FileOpLatencies, max_latency: impl Fn(FileOp) -> Duration) {
     let mut violations: Vec<String> = Vec::new();
     for op in FileOp::ALL {
         let h = aggregate.histogram(op);

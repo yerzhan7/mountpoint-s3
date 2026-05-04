@@ -20,7 +20,7 @@ const PREFETCH_PROBE_READ_SIZE: usize = 1024 * 1024;
 const IDLE_HOLD: Duration = Duration::from_secs(60);
 
 /// A worker that opens a key from `pool`, reads enough of a prefix to force the
-/// prefetcher to issue a second metarequest, then holds the handle idle before 
+/// prefetcher to issue a second metarequest, then holds the handle idle before
 /// closing and re-opening.
 pub struct Idle {
     pub pool: SharedObjectPool,
@@ -47,9 +47,10 @@ impl Worker for Idle {
         let mut iter: u64 = 0;
         while !stop.load(Ordering::Relaxed) {
             iter += 1;
-            let path = mount_path
-                .join(SHARED_OBJECTS_PREFIX)
-                .join(self.pool.key(pick_index(iter, instance, self.pool.count)));
+            let path =
+                mount_path
+                    .join(SHARED_OBJECTS_PREFIX)
+                    .join(self.pool.key(pick_index(iter, instance, self.pool.count)));
             idle_cycle(&path, &mut buf, progress, latencies, stop);
         }
     }
@@ -57,13 +58,7 @@ impl Worker for Idle {
 
 /// One idle-worker iteration: open, read `buf.len()` bytes, hold idle
 /// for [`IDLE_HOLD`], then close.
-fn idle_cycle(
-    path: &Path,
-    buf: &mut [u8],
-    progress: &AtomicU64,
-    latencies: &mut FileOpLatencies,
-    stop: &AtomicBool,
-) {
+fn idle_cycle(path: &Path, buf: &mut [u8], progress: &AtomicU64, latencies: &mut FileOpLatencies, stop: &AtomicBool) {
     let mut file = latencies
         .time(FileOp::Open, || File::open(path))
         .unwrap_or_else(|e| panic!("idle: open of {path:?} failed: {e:?}"));
