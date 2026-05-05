@@ -22,6 +22,8 @@ fn collect_gauges_by_label(
         if key.name() != metric_name {
             return;
         }
+        // Skip non-gauges as same name can be registered as both Gauge and Histogram
+        // (e.g. `pool.reserved_bytes`).
         if !matches!(metric.as_ref(), HdrMetric::Gauge(_)) {
             return;
         }

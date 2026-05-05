@@ -98,6 +98,9 @@ fn compute_test_object_mem_budget() -> u64 {
 }
 
 /// Build an `Uploader<S3CrtClient>` for shared test object uploads.
+///
+/// NOTE: runs in-process, so its `PagedPool` / allocator headroom can inflate the
+/// scenario's peak-memory measurements. TODO: move uploads out-of-process.
 fn build_test_object_uploader(max_object_size: usize) -> (Uploader<S3CrtClient>, String, usize) {
     let bucket = get_test_bucket();
     let min_part_size = (max_object_size as u64).div_ceil(MAX_PARTS) as usize;

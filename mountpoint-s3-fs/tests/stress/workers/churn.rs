@@ -36,10 +36,9 @@ impl Worker for Churn {
         let mut iter: u64 = 0;
         while !stop.load(Ordering::Relaxed) {
             iter += 1;
-            let path =
-                mount_path
-                    .join(SHARED_OBJECTS_PREFIX)
-                    .join(self.pool.pick_key(iter, instance));
+            let path = mount_path
+                .join(SHARED_OBJECTS_PREFIX)
+                .join(self.pool.pick_key(iter, instance));
             read_to_eof_once("churn", &path, &mut buf, progress, latencies, stop);
         }
     }
