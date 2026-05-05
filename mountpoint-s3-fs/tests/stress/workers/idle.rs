@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 use crate::stress::harness::{FileOp, FileOpLatencies, Worker};
 use crate::stress::test_objects::SHARED_OBJECTS_PREFIX;
 
-use super::churn::pick_index;
 use super::common::SharedObjectPool;
 
 /// How much of each object the idle worker reads before going idle.
@@ -50,7 +49,7 @@ impl Worker for Idle {
             let path =
                 mount_path
                     .join(SHARED_OBJECTS_PREFIX)
-                    .join(self.pool.key(pick_index(iter, instance, self.pool.count)));
+                    .join(self.pool.pick_key(iter, instance));
             idle_cycle(&path, &mut buf, progress, latencies, stop);
         }
     }

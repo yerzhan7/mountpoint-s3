@@ -70,9 +70,9 @@ cargo nextest run --release \
    `workers/common.rs`:
    - `SharedObject { key, size }` for a single pre-uploaded object.
    - `SharedObjectPool { key_prefix, count, size }` for a family of
-     identically-sized keys; `pool.key(i)` returns the key of entry `i`,
-     and `pool.manifest()` returns the `(key, size)` entries for every
-     key in the pool.
+     identically-sized keys; `pool.pick_key(iter, instance)` returns a
+     pseudo-random key seeded by `(iter, instance)`, and `pool.manifest()`
+     returns the `(key, size)` entries for every key in the pool.
    Store the descriptor as a field on the worker and derive
    `shared_objects()` from it:
    ```rust

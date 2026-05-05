@@ -39,13 +39,8 @@ impl Worker for Churn {
             let path =
                 mount_path
                     .join(SHARED_OBJECTS_PREFIX)
-                    .join(self.pool.key(pick_index(iter, instance, self.pool.count)));
+                    .join(self.pool.pick_key(iter, instance));
             read_to_eof_once("churn", &path, &mut buf, progress, latencies, stop);
         }
     }
-}
-
-/// Deterministic pseudo-random pick in `0..count`. Shared with [`super::idle::Idle`].
-pub(super) fn pick_index(iter: u64, instance: usize, count: usize) -> usize {
-    (iter.wrapping_mul(2_654_435_761).wrapping_add(instance as u64) as usize) % count
 }

@@ -26,7 +26,7 @@ pub struct SharedObjectPool {
 
 impl SharedObjectPool {
     /// Key for pool entry `index` (0-based). Panics if `index >= self.count`.
-    pub fn key(&self, index: usize) -> String {
+    fn key(&self, index: usize) -> String {
         assert!(
             index < self.count,
             "pool index {index} out of range (count={})",
@@ -38,6 +38,13 @@ impl SharedObjectPool {
     /// `(key, size)` entry for every key in the pool.
     pub fn manifest(&self) -> Vec<(String, usize)> {
         (0..self.count).map(|i| (self.key(i), self.size)).collect()
+    }
+
+    /// Pseudo-randomly pick a key from the pool, seeded by `iter` and `instance` so
+    /// that concurrent workers pick different keys on the same iteration.
+    pub fn pick_key(&self, iter: u64, instance: usize) -> String {
+        let index = (iter.wrapping_mul(2_654_435_761).wrapping_add(instance as u64) as usize) % self.count;
+        self.key(index)
     }
 }
 
