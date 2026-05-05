@@ -7,8 +7,8 @@ use std::sync::Arc;
 use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 
 use crate::common::fuse::TestSessionConfig;
-use crate::harness::{self, Scenario, Worker, default_max_latency};
-use crate::workers::Writer;
+use crate::stress::harness::{self, Scenario, Worker, default_max_latency};
+use crate::stress::workers::Writer;
 
 const NUM_WORKERS: usize = 48;
 const WRITE_CHUNK: usize = 8 * 1024 * 1024; // 8 MiB — matches default part size

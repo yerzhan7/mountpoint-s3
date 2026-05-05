@@ -29,7 +29,7 @@ A single scenario:
 cargo nextest run --release \
     --features stress_tests \
     --package mountpoint-s3-fs \
-    'stress_tests::scenarios::sustained_reads' \
+    'stress::scenarios::sustained_reads' \
     --success-output final --failure-output final
 ```
 
@@ -39,7 +39,7 @@ All scenarios sequentially:
 cargo nextest run --release \
     --features stress_tests \
     --package mountpoint-s3-fs \
-    'stress_tests::' \
+    'stress::' \
     --test-threads=1 \
     --success-output final --failure-output final
 ```
@@ -48,19 +48,19 @@ cargo nextest run --release \
 
 1. Pick the workers that describe the load. Reuse existing ones
    (`SequentialReader`, `Writer`, `Idle`, `Churn`) or add a new type under
-   `tests/stress_tests/workers/`.
-2. Create `tests/stress_tests/scenarios/my_scenario.rs` containing one
+   `tests/stress/workers/`.
+2. Create `tests/stress/scenarios/my_scenario.rs` containing one
    `#[test]` function that:
    - Builds a `Vec<Arc<dyn Worker>>` using `repeat_n` / `chain` /
      `repeat_with` as needed.
    - Builds a `Scenario` value (name, session config, workers,
      `max_latency`).
    - Calls `harness::run(scenario)`.
-3. Register the module in `tests/stress_tests/scenarios/mod.rs`.
+3. Register the module in `tests/stress/scenarios.rs`.
 
 ## Adding a new worker kind
 
-1. Create `tests/stress_tests/workers/my_worker.rs` with a
+1. Create `tests/stress/workers/my_worker.rs` with a
    `struct MyWorker { ... }` implementing `Worker`.
 2. In `run`, wrap every file-system operation in
    `latencies.time(FileOp::_, || ...)` so the harness can aggregate per-op
@@ -101,4 +101,4 @@ cargo nextest run --release \
    check `stop.load(Ordering::Relaxed)` between ops. Panic on I/O errors —
    scenarios are sized so the operations always succeed against a healthy
    session.
-5. Re-export the type from `tests/stress_tests/workers/mod.rs`.
+5. Re-export the type from `tests/stress/workers.rs`.

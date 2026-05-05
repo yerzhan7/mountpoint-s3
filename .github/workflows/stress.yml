@@ -85,4 +85,4 @@ jobs:
             --test-threads=1 \
             --success-output final \
             --failure-output final \
-            'scenarios::${{ matrix.scenario }}'
+            'stress::scenarios::${{ matrix.scenario }}'

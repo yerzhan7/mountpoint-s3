@@ -11,8 +11,8 @@ use std::sync::Arc;
 use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 
 use crate::common::fuse::TestSessionConfig;
-use crate::harness::{self, Scenario, Worker, default_max_latency};
-use crate::workers::{Churn, Idle, SMALL_OBJECT_POOL};
+use crate::stress::harness::{self, Scenario, Worker, default_max_latency};
+use crate::stress::workers::{Churn, Idle, SMALL_OBJECT_POOL};
 
 const NUM_CHURN_WORKERS: usize = 8;
 const NUM_IDLE_WORKERS: usize = 48;

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 
 use crate::common::fuse::TestSessionConfig;
-use crate::harness::{self, Scenario, Worker, default_max_latency};
-use crate::workers::{LARGE_READ_OBJECT, SequentialReader, Writer};
+use crate::stress::harness::{self, Scenario, Worker, default_max_latency};
+use crate::stress::workers::{LARGE_READ_OBJECT, SequentialReader, Writer};
 
 const NUM_READERS: usize = 16;
 const NUM_WRITERS: usize = 24;

@@ -6,8 +6,8 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::harness::{FileOp, FileOpLatencies, Worker};
-use crate::test_objects;
+use crate::stress::harness::{FileOp, FileOpLatencies, Worker};
+use crate::stress::test_objects;
 
 /// A worker that streams `object_size` bytes into a fresh ephemeral key every iteration.
 /// `scope` is the scenario label used as the ephemeral-key scenario segment (e.g.

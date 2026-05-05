@@ -4,8 +4,8 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::harness::{FileOpLatencies, Worker};
-use crate::test_objects::SHARED_OBJECTS_PREFIX;
+use crate::stress::harness::{FileOpLatencies, Worker};
+use crate::stress::test_objects::SHARED_OBJECTS_PREFIX;
 
 use super::common::{SharedObjectPool, read_to_eof_once};
 

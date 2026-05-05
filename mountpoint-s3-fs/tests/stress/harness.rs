@@ -10,7 +10,7 @@ use mountpoint_s3_fs::s3::{Bucket, Prefix, S3Path};
 
 use crate::common::fuse;
 use crate::common::stress_recorder;
-use crate::test_objects::ensure_shared_objects;
+use crate::stress::test_objects::ensure_shared_objects;
 
 mod invariants;
 mod latency;
