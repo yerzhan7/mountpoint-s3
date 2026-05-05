@@ -6,7 +6,7 @@ pub mod cache;
 
 pub mod creds;
 
-#[cfg(any(feature = "fuse_tests", feature = "stress_tests"))]
+#[cfg(feature = "fuse_tests")]
 pub mod fuse;
 
 #[cfg(feature = "s3_tests")]
