@@ -9,7 +9,7 @@ use crate::common::test_recorder::stress::{HdrMetric, HdrRecorder};
 use super::latency::{FileOp, FileOpLatencies};
 use super::report::{format_mib, us_to_ms_str};
 
-/// Collect `(label_value, &HdrMetric)` for every registered gauge whose name matches
+/// Collect `(label_value, Arc<HdrMetric>)` for every registered gauge whose name matches
 /// `metric_name` and that carries a label keyed on `label_key`. Lets invariant checks
 /// auto-discover new `area=` / `kind=` values instead of hardcoding the allowlist.
 fn collect_gauges_by_label(
@@ -18,8 +18,11 @@ fn collect_gauges_by_label(
     label_key: &str,
 ) -> Vec<(String, Arc<HdrMetric>)> {
     let mut out = Vec::new();
-    recorder.for_each(|key, _| {
+    recorder.for_each(|key, metric| {
         if key.name() != metric_name {
+            return;
+        }
+        if !matches!(metric.as_ref(), HdrMetric::Gauge(_)) {
             return;
         }
         let Some(label_value) = key
@@ -29,9 +32,7 @@ fn collect_gauges_by_label(
         else {
             return;
         };
-        if let Some(metric) = recorder.get(metric_name, &[(label_key, label_value.as_str())]) {
-            out.push((label_value, metric));
-        }
+        out.push((label_value, Arc::clone(metric)));
     });
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out

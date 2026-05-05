@@ -8,8 +8,8 @@ deadlocks, per-worker stalls, tail-latency regressions, and memory issues.
 - No file I/O errors.
 - Aggregated per file I/O p100 latency is within `Scenario::max_latency(op)`.
 - No worker stall longer than `Worker::max_idle()`.
-- At teardown, every reservation gauge is back to zero — for each label of
-  `mem.bytes_reserved{area=*}` and `pool.reserved_bytes{kind=*}`.
+- At teardown, every reservation gauge is back to zero.
+- Peak memory usage (reserved and RSS).
 
 ## Environment variables
 

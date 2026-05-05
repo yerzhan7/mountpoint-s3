@@ -45,7 +45,7 @@ pub(super) fn dump_summary(scenario_name: &str, aggregate: &FileOpLatencies) {
     let mut lines: Vec<(String, String)> = Vec::new();
     recorder.for_each(|key, metric| {
         let key_str = format!("{key}");
-        let line = match metric {
+        let line = match metric.as_ref() {
             HdrMetric::Histogram(_) => {
                 let h = metric.histogram_clone();
                 let count = h.len();

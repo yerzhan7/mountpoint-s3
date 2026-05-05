@@ -220,7 +220,7 @@ pub mod stress {
 
         /// Call `f` for every registered metric. Holds a read-side `DashMap` reference per
         /// entry — callers must not re-enter the recorder from `f`.
-        pub fn for_each(&self, mut f: impl FnMut(&Key, &HdrMetric)) {
+        pub fn for_each(&self, mut f: impl FnMut(&Key, &Arc<HdrMetric>)) {
             for entry in self.metrics.iter() {
                 f(entry.key(), entry.value());
             }
