@@ -7,6 +7,11 @@ use tracing::{debug, trace};
 
 use crate::memory::{BufferKind, PagedPool};
 
+// Buffer pruning engine (WI-5 of `specs-memory-limter-project/plan.md`). The
+// engine is intentionally not yet instantiated by `MemoryLimiter::new`; see
+// the module docs for the integration plan.
+pub(crate) mod pruning;
+
 pub const MINIMUM_MEM_LIMIT: u64 = 512 * 1024 * 1024;
 
 /// Buffer areas that can be managed by the memory limiter. This is used for updating metrics.
@@ -72,6 +77,11 @@ pub struct MemoryLimiter {
 
 impl MemoryLimiter {
     pub fn new(pool: PagedPool, mem_limit: u64) -> Self {
+        // TODO(WI-4): construct a `pruning::PruningEngine` here and spawn
+        // `engine.pruning_loop()` on the tokio runtime once the allocation
+        // queue (WI-3) and handle registry (WI-2) can implement the trait
+        // seams defined in `mem_limiter::pruning`. Also hook `trigger()`
+        // into `acquire_async` (enqueue) and `try_wake_pending` (drain).
         let min_reserved = 128 * 1024 * 1024;
         let reserved_mem = (mem_limit / 8).max(min_reserved);
         let formatter = make_format(humansize::BINARY);

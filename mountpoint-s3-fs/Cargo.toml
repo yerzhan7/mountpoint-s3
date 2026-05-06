@@ -48,6 +48,13 @@ syslog = "7.0.0"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["macros", "formatting", "serde-well-known"] }
+# `tokio` is already pulled in transitively by `opentelemetry_sdk`'s
+# `rt-tokio` feature. We take a direct dependency with the `sync` and `time`
+# features for `tokio::sync::Notify` and `tokio::time::sleep` used by the
+# buffer pruning engine (`mem_limiter::pruning`, WI-5 of the memory limiter
+# design). The production loop will be spawned from `MemoryLimiter::new`
+# in a follow-up (WI-4 integration).
+tokio = { version = "1.52.1", features = ["sync", "time"] }
 tracing = { version = "0.1.44", features = ["log"] }
 tracing-log = "0.2.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
@@ -71,6 +78,7 @@ ctor = "0.10.1"
 filetime = "0.2.27"
 futures = { version = "0.3.32", features = ["thread-pool"] }
 humantime-serde = "1.1.1"
+mockall = "0.14.0"
 opentelemetry_sdk = { version = "0.31.0", features = ["testing"] }
 predicates = "3.1.4"
 proptest = "1.11.0"
@@ -83,7 +91,7 @@ sha2 = "0.11.0"
 shuttle = { version = "0.8.1" }
 syscalls = { version = "0.8.1", default-features = false }
 test-case = "3.3.1"
-tokio = { version = "1.52.1", features = ["rt", "macros", "rt-multi-thread"] }
+tokio = { version = "1.52.1", features = ["rt", "macros", "rt-multi-thread", "test-util"] }
 toml = "1.1.2"
 walkdir = "2.5.0"
 wiremock = "0.6.5"
