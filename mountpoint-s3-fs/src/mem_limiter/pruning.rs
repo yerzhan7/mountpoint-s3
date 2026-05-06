@@ -26,15 +26,29 @@
 //!   [`PoolPruneOps`].
 //!
 //! Once those land, a follow-up PR constructs a [`PruningEngine`] inside
-//! `MemoryLimiter::new` and spawns [`PruningEngine::pruning_loop`] on the
-//! tokio runtime. Every entry point defined here is therefore `pub(crate)`.
+//! `MemoryLimiter::new` and spawns [`PruningEngine::pruning_loop`] onto the
+//! crate's existing [`crate::async_util::Runtime`] (which wraps
+//! [`futures::task::Spawn`]; today that is a CRT event-loop-group based
+//! executor). No production [`Clock`] implementation ships in this PR — a
+//! runtime-agnostic timer (for example a `futures-timer`-style sleep or a
+//! thread-based wake) is chosen as part of WI-4. Every entry point defined
+//! here is therefore `pub(crate)`.
 //!
 //! # Testability
 //!
 //! All external effects go through trait seams that are `#[automock]`ed
 //! under `cfg(test)`, so unit tests drive every code path without any real
 //! pool, queue, or runtime. The coalescing window uses an injected
-//! [`Clock`] so `tokio::time::pause` can advance time deterministically.
+//! [`Clock`] so `tokio::time::pause` can advance time deterministically
+//! from inside the crate's (dev-only) tokio test runtime.
+//!
+//! # Notifier choice
+//!
+//! The coalescing signal uses an `async_channel::bounded::<()>(1)` — already
+//! a crate dependency — rather than `tokio::sync::Notify` so the engine has
+//! no coupling to the tokio runtime. `try_send(())` on a full channel
+//! silently drops, which matches `notify_one`'s single-permit coalescing
+//! semantics; `recv().await` on the receiver matches `notified().await`.
 //!
 //! [`MemoryLimiter`]: super::MemoryLimiter
 
@@ -42,8 +56,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use async_channel::{Receiver, Sender, TrySendError};
 use async_trait::async_trait;
-use tokio::sync::Notify;
 
 /// Result of a single pruning strategy or pruning round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,18 +122,25 @@ pub(crate) trait HandleRegistryOps: Send + Sync {
 /// Abstraction over time so the coalescing window in
 /// [`PruningEngine::pruning_loop`] can be driven deterministically by tests.
 ///
-/// Production uses [`TokioClock`], which forwards to `tokio::time::sleep`.
+/// No production implementation ships in this PR — a runtime-agnostic timer
+/// will be added alongside the WI-4 wiring of `PruningEngine` into the
+/// live [`super::MemoryLimiter`]. Tests use an ephemeral `TokioClock`
+/// gated under `#[cfg(test)]`.
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub(crate) trait Clock: Send + Sync {
     async fn sleep(&self, duration: Duration);
 }
 
-/// Production [`Clock`] implementation backed by [`tokio::time::sleep`].
+/// Test-only [`Clock`] implementation backed by [`tokio::time::sleep`]. Lives
+/// under `#[cfg(test)]` because `tokio::time::sleep` requires a tokio
+/// runtime, which mountpoint's non-test code does not provide (it uses the
+/// CRT event-loop-group threads via [`crate::async_util::Runtime`]).
+#[cfg(test)]
 #[derive(Debug, Default)]
-#[allow(dead_code)] // Constructed by follow-up PR (WI-4 integration).
 pub(crate) struct TokioClock;
 
+#[cfg(test)]
 #[async_trait]
 impl Clock for TokioClock {
     async fn sleep(&self, duration: Duration) {
@@ -130,11 +151,11 @@ impl Clock for TokioClock {
 /// Buffer pruning engine.
 ///
 /// Holds trait-object references to its three cooperating subsystems plus a
-/// [`Clock`], a round-robin strategy index, and a [`Notify`] used by
-/// [`PruningEngine::trigger`] to wake [`PruningEngine::pruning_loop`].
-///
-/// See the module-level docs for scope, integration status, and the
-/// algorithm used by [`PruningEngine::run_pruning_round`].
+/// [`Clock`], a round-robin strategy index, and a capacity-1
+/// `async_channel` used by [`PruningEngine::trigger`] to wake
+/// [`PruningEngine::pruning_loop`]. See the module-level docs for the
+/// notifier rationale and the algorithm used by
+/// [`PruningEngine::run_pruning_round`].
 #[allow(dead_code)] // Constructed by follow-up PR (WI-4 integration).
 pub(crate) struct PruningEngine {
     pool: Arc<dyn PoolPruneOps>,
@@ -142,12 +163,14 @@ pub(crate) struct PruningEngine {
     registry: Arc<dyn HandleRegistryOps>,
     clock: Arc<dyn Clock>,
     next_strategy: AtomicUsize,
-    notify: Notify,
+    notify_tx: Sender<()>,
+    notify_rx: Receiver<()>,
 }
 
 impl PruningEngine {
     /// Create a new pruning engine. Does not start the background loop —
-    /// callers must `tokio::spawn(engine.pruning_loop())` once ready.
+    /// callers must spawn [`Self::pruning_loop`] on whichever executor is
+    /// in use (today: the crate's [`crate::async_util::Runtime`]).
     #[allow(dead_code)] // Constructed by follow-up PR (WI-4 integration).
     pub(crate) fn new(
         pool: Arc<dyn PoolPruneOps>,
@@ -155,13 +178,15 @@ impl PruningEngine {
         registry: Arc<dyn HandleRegistryOps>,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        let (notify_tx, notify_rx) = async_channel::bounded(1);
         Self {
             pool,
             queue,
             registry,
             clock,
             next_strategy: AtomicUsize::new(0),
-            notify: Notify::new(),
+            notify_tx,
+            notify_rx,
         }
     }
 
@@ -251,24 +276,33 @@ impl PruningEngine {
     /// after the coalescing window.
     ///
     /// Multiple `trigger` calls made before the loop wakes collapse into a
-    /// single round (the underlying [`Notify`] stores at most one permit).
+    /// single round: the notifier is a capacity-1 channel and additional
+    /// sends fail with [`TrySendError::Full`], which we silently drop.
     /// Callers should invoke this from `acquire_async` on enqueue and from
     /// `try_wake_pending` when the queue remains non-empty (spec §5.4).
     #[allow(dead_code)] // Invoked by WI-3/WI-4 once wired in.
     pub(crate) fn trigger(&self) {
-        self.notify.notify_one();
+        match self.notify_tx.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => {
+                // Either the permit was stored, or a previous trigger is
+                // already pending — coalesce by doing nothing.
+            }
+            Err(TrySendError::Closed(())) => {
+                // The loop's receiver has been dropped — nothing to signal.
+            }
+        }
     }
 
     /// Background coalescing loop (spec §5.4).
     ///
     /// Waits for a [`trigger`](Self::trigger), sleeps for the 1 ms
     /// coalescing window via the injected [`Clock`], then runs exactly one
-    /// pruning round. Intended to be spawned once via `tokio::spawn` at
-    /// memory-limiter startup (not done in this PR — see the module docs).
+    /// pruning round. Intended to be spawned once at memory-limiter startup
+    /// (not done in this PR — see the module docs). Exits cleanly if the
+    /// notifier channel is closed (e.g. the [`PruningEngine`] was dropped).
     #[allow(dead_code)] // Spawned by WI-4 once MemoryLimiter integration lands.
     pub(crate) async fn pruning_loop(self: Arc<Self>) {
-        loop {
-            self.notify.notified().await;
+        while self.notify_rx.recv().await.is_ok() {
             self.clock.sleep(Duration::from_millis(1)).await;
             self.run_pruning_round();
         }
@@ -542,8 +576,10 @@ mod tests {
         let engine = build_loop_engine(counter.clone());
         let handle = tokio::spawn(engine.clone().pruning_loop());
 
-        // Fire five triggers before the loop has a chance to run. Notify's
-        // semantics collapse these into a single permit.
+        // Fire five triggers before the loop has a chance to run. The
+        // capacity-1 notifier channel collapses these into a single
+        // pending permit (four `try_send`s fail with `Full` and are
+        // dropped silently).
         for _ in 0..5 {
             engine.trigger();
         }
