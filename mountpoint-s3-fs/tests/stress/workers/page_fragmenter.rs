@@ -35,8 +35,6 @@ const WRITE_BYTES: usize = 4 * 1024;
 const PER_PAGE_SETTLE: Duration = Duration::from_millis(200);
 /// The shared object read in a loop during phase 3.
 const READ_TARGET: SharedObject = super::sequential_reader::LARGE_READ_OBJECT;
-/// Read chunk size for phase 3 — matches the default part size.
-const READ_CHUNK: usize = 8 * 1024 * 1024;
 
 /// A single-threaded worker that fragments the buffer pool (phase 1: open `NUM_WRITERS` partial
 /// write handles across whole pages; phase 2: close all but `NUM_SURVIVORS`, one per page; phase
@@ -44,6 +42,9 @@ const READ_CHUNK: usize = 8 * 1024 * 1024;
 pub struct PageFragmenter {
     /// Scenario label used as the ephemeral-key scenario segment.
     pub scope: &'static str,
+    /// Read chunk size for phase 3. Set to the session's read part size so reads allocate from
+    /// their own size-pool, distinct from the writers' pinned pages.
+    pub read_chunk: usize,
 }
 
 impl Worker for PageFragmenter {
@@ -110,7 +111,7 @@ impl Worker for PageFragmenter {
         // Phase 3: hold the survivors (keeping their pages pinned) and read a shared object in a
         // loop until stop. `survivors` stays in scope for the whole loop.
         let path = mount_path.join(SHARED_OBJECTS_PREFIX).join(READ_TARGET.key);
-        let mut buf = vec![0u8; READ_CHUNK];
+        let mut buf = vec![0u8; self.read_chunk];
         while !stop.load(Ordering::Relaxed) {
             read_to_eof_once("page_fragmenter", &path, &mut buf, progress, latencies, stop);
         }
