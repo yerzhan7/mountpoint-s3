@@ -10,4 +10,5 @@ mod mixed_rw_read16_write8;
 mod page_creation_under_pressure;
 mod page_fragmentation;
 mod sustained_reads;
+mod sustained_reads_large_window;
 mod sustained_writes;
