@@ -59,6 +59,9 @@ jobs:
           - held_writes_vs_reads
           - many_handlers
           - page_fragmentation
+          - mixed_rw_read16_write8
+          - mixed_rw_read8_write16
+          - mixed_rw_oversized
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6

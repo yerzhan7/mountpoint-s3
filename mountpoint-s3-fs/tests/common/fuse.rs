@@ -130,6 +130,13 @@ impl TestSessionConfig {
         self
     }
 
+    /// Override the part size for this test session. This is the write part size; use
+    /// [`Self::with_read_part_size`] to give reads a different part size.
+    pub fn with_part_size(mut self, part_size: usize) -> Self {
+        self.part_size = part_size;
+        self
+    }
+
     /// Override the read part size, giving reads and writes distinct part sizes (and therefore
     /// distinct `PagedPool` size-pools). Writes continue to use `part_size`.
     pub fn with_read_part_size(mut self, read_part_size: usize) -> Self {
