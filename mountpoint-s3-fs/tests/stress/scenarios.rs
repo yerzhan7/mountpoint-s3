@@ -7,6 +7,7 @@ mod mixed_rw;
 mod mixed_rw_oversized;
 mod mixed_rw_read8_write16;
 mod mixed_rw_read16_write8;
+mod page_creation_under_pressure;
 mod page_fragmentation;
 mod sustained_reads;
 mod sustained_writes;
