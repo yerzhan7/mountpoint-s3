@@ -58,6 +58,7 @@ jobs:
           - idle_and_churn
           - held_writes_vs_reads
           - many_handlers
+          - page_fragmentation
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
