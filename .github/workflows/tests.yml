@@ -2,7 +2,9 @@ name: Tests
 
 on:
   push:
-    branches: [ "main", "wf-changes/**" ]
+    # NOTE (fork-only): "main" intentionally removed so that only the Stress Tests
+    # workflow runs on pushes to main in this fork. Do not merge upstream.
+    branches: [ "wf-changes/**" ]
   pull_request:
   merge_group:
     types: [ "checks_requested" ]

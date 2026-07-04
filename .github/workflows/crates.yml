@@ -1,8 +1,8 @@
 name: Crate checks
 
 on:
-  push:
-    branches: [ "main" ]
+  # NOTE (fork-only): push-to-main trigger intentionally removed so that only the
+  # Stress Tests workflow runs on pushes to main in this fork. Do not merge upstream.
   pull_request:
     branches: [ "main" ]
   merge_group:

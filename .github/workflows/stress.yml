@@ -9,8 +9,13 @@ on:
         required: true
         type: string
   push:
-    branches: [main]
+    branches: [main, feature/memory-limit, "wf-changes/**"]
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to checkout and stress-test."
+        required: false
+        type: string
 
 permissions:
   id-token: write
