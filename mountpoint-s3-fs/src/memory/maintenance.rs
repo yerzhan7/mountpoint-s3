@@ -29,7 +29,61 @@ pub const PRUNING_TICK: Duration = Duration::from_millis(1);
 /// escalates past the natural-release path even while uploads/active reads are in flight:
 /// it resets an idle cursor, or — if none is eligible — clears one active cursor's backward
 /// seek window. Acts as a starvation backstop.
-const PRUNING_STARVATION_THRESHOLD: Duration = Duration::from_millis(5);
+///
+/// # Why 50ms
+///
+/// This value has to separate two cases that look identical from the queue's point of view —
+/// a waiter that is merely *behind* an in-flight S3 GET, and one that is genuinely deadlocked
+/// because nothing will ever release a buffer. Escalating is destructive (a cursor reset throws
+/// away a warm prefetch stream and re-issues its GET; clearing a seek window discards up to
+/// `max_backward_seek_distance` of buffered data), so the threshold wants to sit *above* the
+/// normal wait distribution. But escalating is also how the pool recovers when the budget is
+/// genuinely over-committed, so it must sit low enough that recovery stays fast. 50ms is a
+/// compromise between those two pressures, not a clean win on either.
+///
+/// Measured on an `m5dn.24xlarge` in `us-east-1` against a same-region bucket, 8 MiB parts,
+/// `--memory-target 512` (384 MiB data-buffer budget).
+///
+/// **Why the old 5ms was wrong.** A buffer is released when a GET completes, and a GET cannot
+/// complete faster than its own first-byte latency, measured here at p50 24ms / p99 51-60ms.
+/// 5ms therefore fired while the *median* healthy request was still in flight — it was
+/// structurally guaranteed to escalate on waiters that were about to be served anyway. With the
+/// backstop disabled under healthy pressure (24 sequential streams, all waiters eventually served
+/// by natural release), the queue wait distribution is p50 4.8ms, p99 85ms, max 166ms: a waiter
+/// behind one or two GETs legitimately waits tens of ms. At 5ms the pruner tore down ~24 prefetch
+/// streams per second to reclaim memory an in-flight GET was about to release.
+///
+/// **Why not higher.** Escalation is load-bearing when the budget is over-committed: with the
+/// backstop effectively disabled and 48 streams against a 48-part budget (each wanting two),
+/// throughput collapsed from 156 MiB/s to 2.7 MiB/s. Raising the threshold in that regime directly
+/// delays recovery, and the cost shows up in FUSE `read()` latency. Stress scenarios, mean of
+/// 2 reps at 45s each:
+///
+/// | scenario                    | 50ms p50 / p99      | 100ms p50 / p99     |
+/// |-----------------------------|---------------------|---------------------|
+/// | `many_readers_held_budget`  | 2812 / 3555 ms      | 4387 / 5116 ms      |
+/// | `single_reader_held_budget` | 198 / 379 ms        | 271 / 555 ms        |
+/// | `sustained_reads`           | 688 / 1082 ms       | 703 / 1058 ms       |
+///
+/// Under held-budget pressure 100ms costs ~40-55% on read p50/p99 and ~30% fewer completed reads;
+/// `sustained_reads` (no artificial budget hold) is a wash. Pushing further is worse: at 500ms
+/// worst-case queue wait reached 24s, past the 20s per-worker stall watchdog, failing
+/// `many_readers_held_budget` intermittently (1 in 6 runs).
+///
+/// **What 50ms gives up.** It still sits below the 85ms natural-release p99, so it does fire on
+/// some healthy waiters: cursor resets over 45s are ~338 at 50ms vs ~2 at 100ms, and a
+/// throughput-oriented fio benchmark (24 streams, 1 MiB reads) preferred 100ms by ~6%. That
+/// benchmark measures aggregate bandwidth; the stress scenarios above measure per-`read()`
+/// latency under a held budget, and they disagree. 50ms is chosen because the latency regression
+/// is the larger and more user-visible effect, and because a value below the release p99 fails
+/// safe: it over-escalates (wasted work, recoverable) rather than under-escalates (stalls).
+///
+/// Re-derive with `stress::scenarios::many_readers_held_budget` and `single_reader_held_budget`
+/// (recovery latency, the binding constraint) plus `sustained_reads` (spurious-escalation cost);
+/// watch `mem.cursor_resets`. Note both effects are only visible on a base that includes the
+/// `do_read` first-part-copy pool-deadlock fix; without it these scenarios wedge in the page
+/// cache regardless of this threshold.
+const PRUNING_STARVATION_THRESHOLD: Duration = Duration::from_millis(50);
 
 /// Spawn the background maintenance thread. Must be called once after constructing
 /// the pool, at filesystem init. Holds a [`Weak`] to the pool so the thread
