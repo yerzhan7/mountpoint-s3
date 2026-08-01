@@ -8,7 +8,7 @@ use crate::sync::{Arc, RwLock};
 
 use super::allocation_queue::AllocationQueue;
 use super::buffers::{PoolBuffer, PoolBufferMut};
-use super::limiter::{CursorHandle, MemoryLimiter};
+use super::limiter::{AllocPolicy, CursorHandle, MemoryLimiter};
 use super::pages::{MAX_BUFFERS_PER_PAGE, Page, PagedBufferPtr};
 use super::stats::{BufferKind, SizePoolStats};
 
@@ -123,7 +123,7 @@ impl PagedPool {
 
     fn get_buffer(&self, size: usize, kind: BufferKind, cursor_id: Option<CursorId>) -> PoolBuffer {
         self.inner
-            .try_get_buffer(size, kind, cursor_id, true)
+            .try_get_buffer(size, kind, cursor_id, AllocPolicy::Forced)
             .expect("forced allocations cannot fail")
     }
 
@@ -278,7 +278,7 @@ impl PagedPoolInner {
     async fn get_buffer_async(&self, size: usize, kind: BufferKind, cursor_id: Option<CursorId>) -> PoolBuffer {
         // Fast path: if the queue is empty, try to acquire immediately.
         if !self.allocation_queue.has_pending()
-            && let Some(buffer) = self.try_get_buffer(size, kind, cursor_id, false)
+            && let Some(buffer) = self.try_get_buffer(size, kind, cursor_id, AllocPolicy::Normal)
         {
             return buffer;
         }
@@ -302,7 +302,7 @@ impl PagedPoolInner {
         // Await the buffer from the queue. Err(Canceled) can only happen during pool shutdown.
         // TODO(memory-limiter): signal error to CRT via aws_future_s3_buffer_ticket_set_error.
         rx.await.unwrap_or_else(|_| {
-            self.try_get_buffer(size, kind, cursor_id, true)
+            self.try_get_buffer(size, kind, cursor_id, AllocPolicy::Forced)
                 .expect("forced allocations cannot fail")
         })
     }
@@ -325,10 +325,18 @@ impl PagedPoolInner {
         size: usize,
         kind: BufferKind,
         cursor_id: Option<CursorId>,
-        ignore_limit: bool,
+        policy: AllocPolicy,
     ) -> Option<PoolBuffer> {
+        // Under pressure a new page must not claim more than the requester needs: a multi-buffer
+        // page can swallow the whole reserve and only becomes reclaimable once fully empty.
+        let single_buffer_page = match policy {
+            AllocPolicy::Normal => self.is_memory_pressure(),
+            AllocPolicy::Reserve => true,
+            AllocPolicy::Forced => false,
+        };
+        let max_buffers_per_page = if single_buffer_page { 1 } else { MAX_BUFFERS_PER_PAGE };
         let buffer = if let Some(pool) = self.get_pool_for_size(size)
-            && let Some(buffer_ptr) = pool.try_acquire(kind)
+            && let Some(buffer_ptr) = pool.try_acquire(kind, max_buffers_per_page, policy)
         {
             metrics::histogram!("pool.acquired_bytes", "type" => "primary", "kind" => kind.as_str())
                 .record(size as f64);
@@ -339,7 +347,7 @@ impl PagedPoolInner {
         } else {
             metrics::histogram!("pool.acquired_bytes", "type" => "secondary", "kind" => kind.as_str())
                 .record(size as f64);
-            PoolBuffer::try_new_secondary(size, kind, self.limiter.clone(), ignore_limit)?
+            PoolBuffer::try_new_secondary(size, kind, self.limiter.clone(), policy)?
         };
         self.limiter.on_pool_acquire(size, cursor_id);
         Some(buffer)
@@ -400,7 +408,7 @@ impl PagedPoolInner {
     fn process_pending(&self) {
         while self
             .allocation_queue
-            .try_fulfill_front(|pending| self.try_get_buffer(pending.size, pending.kind, pending.cursor_id, false))
+            .try_fulfill_front(|pending| self.try_get_buffer(pending.size, pending.kind, pending.cursor_id, AllocPolicy::Reserve))
         {
         }
     }
@@ -435,7 +443,12 @@ impl SizePool {
     /// from a newly allocated page.
     ///
     /// Returns `None` if allocating a new page would hit the memory limit.
-    fn try_acquire(&self, kind: BufferKind) -> Option<PagedBufferPtr> {
+    fn try_acquire(
+        &self,
+        kind: BufferKind,
+        max_buffers_per_page: usize,
+        policy: AllocPolicy,
+    ) -> Option<PagedBufferPtr> {
         {
             // Fast path: reserve a buffer from the existing pages (under a read lock).
             let read_pages = self.pages.read().unwrap();
@@ -456,9 +469,9 @@ impl SizePool {
         tracing::trace!(size = self.stats.buffer_size, "allocate new memory pool page");
         // Try to allocate a new page with the maximum buffer count first. If there is not enough
         // memory, keep retrying by halving the count.
-        let mut buffer_count = MAX_BUFFERS_PER_PAGE;
+        let mut buffer_count = max_buffers_per_page;
         while buffer_count > 0 {
-            let Some(page) = Page::try_new(&self.stats, buffer_count, kind) else {
+            let Some(page) = Page::try_new(&self.stats, buffer_count, kind, policy) else {
                 buffer_count /= 2;
                 continue;
             };
@@ -811,7 +824,7 @@ mod tests {
 
             // Fill all available memory.
             let mut blockers = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, AllocPolicy::Normal) {
                 blockers.push(buffer);
             }
 
@@ -841,7 +854,7 @@ mod tests {
 
             // Fill memory and enqueue a waiter.
             let mut blockers = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, AllocPolicy::Normal) {
                 blockers.push(buffer);
             }
             let pool_clone = pool.clone();
@@ -873,7 +886,7 @@ mod tests {
             let pool = tight_pool(BUF);
 
             let mut blockers = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, AllocPolicy::Normal) {
                 blockers.push(buffer);
             }
 
@@ -904,7 +917,7 @@ mod tests {
 
             // Fill all memory.
             let mut blockers = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, AllocPolicy::Normal) {
                 blockers.push(buffer);
             }
 
@@ -948,7 +961,7 @@ mod tests {
 
             // Fill all memory.
             let mut blockers = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, AllocPolicy::Normal) {
                 blockers.push(buffer);
             }
 
@@ -1006,7 +1019,7 @@ mod tests {
 
                 // Fill memory leaving exactly one free buffer slot.
                 let mut blockers = Vec::new();
-                while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+                while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, AllocPolicy::Normal) {
                     blockers.push(buffer);
                 }
                 let budget_buffers = blockers.len();
@@ -1068,30 +1081,48 @@ mod tests {
             // Fill the budget with non-read (upload) buffers. The reduced ceiling
             // (mem_limit - BUF) stops them one buffer short of the full budget.
             let mut writes = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Append, None, false) {
+            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Append, None, AllocPolicy::Normal) {
                 writes.push(buffer);
             }
 
             // A further non-read allocation is denied — the last slice is off-limits to writes.
             assert!(
                 pool.inner
-                    .try_get_buffer(BUF, BufferKind::PutObject, None, false)
+                    .try_get_buffer(BUF, BufferKind::PutObject, None, AllocPolicy::Normal)
                     .is_none(),
                 "non-read allocation must not consume the read-reserved slice"
             );
 
-            // But prunable allocations (reads and disk-cache read-backs) can still claim the slice.
+            // Prunable allocations do not take the reserve on the fast path either — it is
+            // single-occupancy and granted only to the allocation queue head.
             assert!(
                 pool.inner
-                    .try_get_buffer(BUF, BufferKind::GetObject, None, false)
-                    .is_some(),
-                "read allocation must succeed into the reserved slice"
+                    .try_get_buffer(BUF, BufferKind::GetObject, None, AllocPolicy::Normal)
+                    .is_none(),
+                "read allocation must not take the reserve outside the queue"
             );
+
+            // As the queue head, a prunable allocation claims the reserve.
+            let reserved = pool
+                .inner
+                .try_get_buffer(BUF, BufferKind::GetObject, None, AllocPolicy::Reserve)
+                .expect("queue head read allocation must succeed into the reserved slice");
+
+            // Single occupancy: while it is held, no other allocation fits — not even prunable.
             assert!(
                 pool.inner
-                    .try_get_buffer(BUF, BufferKind::DiskCache, None, false)
+                    .try_get_buffer(BUF, BufferKind::DiskCache, None, AllocPolicy::Reserve)
+                    .is_none(),
+                "the reserve holds at most one prunable allocation at a time"
+            );
+
+            // Once released, the next prunable queue head can take it.
+            drop(reserved);
+            assert!(
+                pool.inner
+                    .try_get_buffer(BUF, BufferKind::DiskCache, None, AllocPolicy::Reserve)
                     .is_some(),
-                "disk-cache allocation must succeed into the reserved slice"
+                "disk-cache allocation must succeed into the freed reserve"
             );
         }
     }

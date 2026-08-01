@@ -163,7 +163,7 @@ mod tests {
     use bytes::Bytes;
     use futures::executor::block_on;
 
-    use crate::memory::limiter::MemoryLimiter;
+    use crate::memory::limiter::{AllocPolicy, MemoryLimiter};
     use crate::memory::pool::PagedPoolInner;
     use crate::memory::{BufferKind, CandidateSize, PagedPool};
 
@@ -197,7 +197,7 @@ mod tests {
     /// buffers so the caller can drop them when the test is done.
     fn fill_and_enqueue_waiter(pool: &PagedPool) -> Vec<Bytes> {
         let mut blockers = Vec::new();
-        while let Some(buffer) = pool.inner().try_get_buffer(BUF, BufferKind::Other, None, false) {
+        while let Some(buffer) = pool.inner().try_get_buffer(BUF, BufferKind::Other, None, AllocPolicy::Normal) {
             blockers.push(buffer.into_bytes());
         }
         let pool_clone = pool.clone();

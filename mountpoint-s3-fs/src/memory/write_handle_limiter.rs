@@ -223,6 +223,7 @@ mod tests {
     /// read can still allocate — the fix for the `held_writes_vs_reads` stall.
     #[test]
     fn read_reserve_lowers_the_write_cap() {
+        use crate::memory::limiter::AllocPolicy;
         use crate::memory::{BufferKind, CandidateSize, PagedPool};
 
         let pool = PagedPool::config()
@@ -248,7 +249,7 @@ mod tests {
         // A read can still allocate while all admitted writers hold their buffers.
         assert!(
             pool.inner
-                .try_get_buffer(PART_SIZE_8MIB, BufferKind::GetObject, None, false)
+                .try_get_buffer(PART_SIZE_8MIB, BufferKind::GetObject, None, AllocPolicy::Reserve)
                 .is_some(),
             "a read must still allocate its buffer while all admitted writers hold theirs"
         );

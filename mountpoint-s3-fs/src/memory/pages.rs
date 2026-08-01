@@ -1,6 +1,7 @@
 use crate::sync::{Arc, Mutex};
 
 use super::buffers::ManagedBuffer;
+use super::limiter::AllocPolicy;
 use super::stats::{BufferKind, SizePoolStats};
 
 /// Maximum number of buffers allowed on a page.
@@ -44,14 +45,19 @@ impl Page {
     /// Create a new page and allocate the required memory.
     ///
     /// Returns `None` if the allocation would hit the memory limit.
-    pub fn try_new(stats: &Arc<SizePoolStats>, buffer_count: usize, kind: BufferKind) -> Option<Self> {
+    pub fn try_new(
+        stats: &Arc<SizePoolStats>,
+        buffer_count: usize,
+        kind: BufferKind,
+        policy: AllocPolicy,
+    ) -> Option<Self> {
         assert!(
             buffer_count > 0 && buffer_count <= MAX_BUFFERS_PER_PAGE,
             "buffer_count must be positive and less than {}, but was {}.",
             MAX_BUFFERS_PER_PAGE,
             buffer_count
         );
-        let page_buffer = stats.try_allocate_page(buffer_count, kind)?;
+        let page_buffer = stats.try_allocate_page(buffer_count, kind, policy)?;
 
         // SAFETY: last_buffer is guaranteed to belong to the allocated object.
         let last_buffer = unsafe { page_buffer.as_raw_ptr().add((buffer_count - 1) * stats.buffer_size) };
@@ -143,7 +149,7 @@ impl Page {
     pub(super) fn new_for_tests(buffer_size: usize) -> Page {
         let limiter = super::limiter::MemoryLimiter::new(usize::MAX, 0);
         let stats = SizePoolStats::new(buffer_size, Arc::new(limiter));
-        Page::try_new(&Arc::new(stats), MAX_BUFFERS_PER_PAGE, BufferKind::Other)
+        Page::try_new(&Arc::new(stats), MAX_BUFFERS_PER_PAGE, BufferKind::Other, AllocPolicy::Forced)
             .expect("allocation should succeed with usize::MAX limit")
     }
 }

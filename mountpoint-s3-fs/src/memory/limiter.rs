@@ -43,6 +43,18 @@ pub fn write_buffer_budget_for(mem_limit: usize, prunable_buffer_size: usize) ->
     data_buffer_budget_for(mem_limit).saturating_sub(prunable_reserved_for(prunable_buffer_size))
 }
 
+/// Which ceiling an allocation attempt is held to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocPolicy {
+    /// Must leave the prunable reserve free. Used by all fast-path allocations.
+    Normal,
+    /// May take the reserve if the caller is the allocation queue head, the kind is prunable, and
+    /// the reserve is currently unoccupied. Single-occupancy: only one such allocation fits.
+    Reserve,
+    /// Bypass the limit entirely. Only for allocations that cannot fail.
+    Forced,
+}
+
 /// Buffer areas that can be managed by the memory limiter. This is used for updating metrics.
 #[derive(Debug)]
 pub enum BufferArea {
@@ -288,9 +300,7 @@ impl MemoryLimiter {
 
     /// Try to allocate `size` bytes from the pool budget.
     ///
-    /// `kind` selects the ceiling: prunable kinds (see [`BufferKind::is_prunable`]) may use the full
-    /// `mem_limit`, while non-prunable kinds stop `prunable_reserved` bytes short, keeping that slice
-    /// available for prunable allocations.
+    /// `policy` selects the ceiling. See [`AllocPolicy`].
     ///
     /// `track` controls per-kind byte accounting: `true` records the allocation against `kind` (and
     /// releases it on drop), `false` skips tracking. Page allocations pass `false` because their
@@ -300,24 +310,27 @@ impl MemoryLimiter {
         size: usize,
         kind: BufferKind,
         track: bool,
-        forced: bool,
+        policy: AllocPolicy,
     ) -> Option<ManagedBuffer> {
-        if forced {
+        if matches!(policy, AllocPolicy::Forced) {
             self.allocated_bytes.fetch_add(size, Ordering::SeqCst);
             metrics::gauge!("pool.allocated_bytes").increment(size as f64);
         } else {
             let start = Instant::now();
-            // Prunable kinds use the full limit; others must leave `prunable_reserved` bytes free.
-            let ceiling = if kind.is_prunable() {
-                self.mem_limit
-            } else {
-                self.mem_limit.saturating_sub(self.prunable_reserved)
-            };
+            // Every allocation must leave `prunable_reserved` bytes free, except a single prunable
+            // allocation that fits inside the reserve and finds it unoccupied.
+            let ceiling = self.mem_limit.saturating_sub(self.prunable_reserved);
+            let reserve_eligible = matches!(policy, AllocPolicy::Reserve)
+                && kind.is_prunable()
+                && size <= self.prunable_reserved;
             let mut mem_allocated = self.allocated_bytes.load(Ordering::SeqCst);
             loop {
                 let new_mem_allocated = mem_allocated.saturating_add(size);
                 let new_total_mem_usage = new_mem_allocated.saturating_add(self.additional_mem_reserved);
-                if new_total_mem_usage > ceiling {
+                let current_total_mem_usage = mem_allocated.saturating_add(self.additional_mem_reserved);
+                let admitted = new_total_mem_usage <= ceiling
+                    || (reserve_eligible && current_total_mem_usage <= ceiling);
+                if !admitted {
                     trace!(new_total_mem_usage, "not enough memory to allocate");
                     metrics::histogram!("pool.allocate_latency_us").record(start.elapsed().as_micros() as f64);
                     return None;

@@ -150,7 +150,7 @@ impl AllocationQueue {
     /// Returns `false` if the queue was empty or `try_get_buffer` returned `None`.
     ///
     /// Skips (and removes) cancelled entries in the queue.
-    pub fn try_fulfill_front(&self, try_get_buffer: impl FnOnce(&PendingAllocation) -> Option<PoolBuffer>) -> bool {
+    pub fn try_fulfill_front(&self, mut try_get_buffer: impl FnMut(&PendingAllocation) -> Option<PoolBuffer>) -> bool {
         if !self.has_pending() {
             return false;
         }
@@ -184,7 +184,7 @@ impl AllocationQueue {
     ///
     /// Returns `None` if both queues are empty or the predicate returns `false`.
     /// Sets `has_pending` to `false` if both queues become empty after removal.
-    fn pop_front_if(&self, predicate: impl FnOnce(&PendingAllocation) -> bool) -> Option<PendingAllocation> {
+    fn pop_front_if(&self, mut predicate: impl FnMut(&PendingAllocation) -> bool) -> Option<PendingAllocation> {
         let mut inner = self.inner.lock().unwrap();
 
         // Prune cancelled entries from the front of each queue.
@@ -195,16 +195,40 @@ impl AllocationQueue {
             inner.low.pop_front();
         }
 
-        let front = inner.high.front().or_else(|| inner.low.front());
-        let Some(front) = front else {
+        if inner.high.is_empty() && inner.low.is_empty() {
             self.has_pending.store(false, Ordering::SeqCst);
             return None;
+        }
+
+        // Try the head first. If it cannot be served, only prunable entries may skip ahead of it —
+        // they are the ones eligible for the reserve, and an unservable non-prunable head must not
+        // block them.
+        let picked = {
+            let ordered = inner
+                .high
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (true, i, e))
+                .chain(inner.low.iter().enumerate().map(|(i, e)| (false, i, e)));
+            let mut picked = None;
+            for (position, (is_high, index, entry)) in ordered.enumerate() {
+                if entry.sender.is_canceled() || (position > 0 && !entry.kind.is_prunable()) {
+                    continue;
+                }
+                if predicate(entry) {
+                    picked = Some((is_high, index));
+                    break;
+                }
+            }
+            picked
         };
 
-        if !predicate(front) {
-            return None;
-        }
-        let entry = inner.high.pop_front().or_else(|| inner.low.pop_front());
+        let (is_high, index) = picked?;
+        let entry = if is_high {
+            inner.high.remove(index)
+        } else {
+            inner.low.remove(index)
+        };
         if inner.high.is_empty() && inner.low.is_empty() {
             self.has_pending.store(false, Ordering::SeqCst);
         }
