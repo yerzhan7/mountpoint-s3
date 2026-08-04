@@ -336,6 +336,12 @@ where
                     .extend(chunk)
                     .inspect_err(|e| warn!(key, error=?e, "integrity check for body part failed"))?;
                 if buffer.len() < block_size as usize {
+                    // This partial block is carried across the `request_stream.next().await` above,
+                    // which has to allocate the next part buffer. `extend` aliases the body's pool
+                    // buffer when `buffer` was empty, so copy off it first: pinning one part while
+                    // blocking for the next wedges the read under memory pressure, since the
+                    // prunable reserve is a global slot rather than a per-stream one.
+                    buffer = buffer.into_detached()?;
                     break;
                 }
 
@@ -423,7 +429,7 @@ mod tests {
     use test_case::test_case;
 
     use crate::data_cache::InMemoryDataCache;
-    use crate::memory::{CandidateSize, PagedPool};
+    use crate::memory::{BufferKind, CandidateSize, PagedPool};
     use crate::object::ObjectId;
 
     use super::*;
@@ -579,6 +585,88 @@ mod tests {
                 compare_read(&id, &object, request_task);
             }
         }
+    }
+
+    /// `compose_parts` must not still be holding a body part's pool buffer when it goes back to the
+    /// stream for the next part.
+    ///
+    /// It accumulates bodies into a partial cache block, and `ChecksummedBytes::extend` aliases its
+    /// argument's storage when the accumulator is empty. If that alias survives the `await` for the
+    /// following part, the composer pins one part buffer while allocating another; with a
+    /// single-buffer prunable reserve per size, nothing can satisfy the second allocation and a
+    /// cache-miss read wedges forever (the `cache_hit_vs_miss_held_budget` stress scenario).
+    ///
+    /// Drives the composer with a pool-backed body and asserts the buffer is accounted as released
+    /// by the time the next part is requested. `MockClient` does not allocate response bodies from
+    /// the pool, so a mock-backed read cannot exercise this.
+    #[test]
+    fn compose_parts_releases_the_part_buffer_before_awaiting_the_next() {
+        let block_size = 1 * MB;
+        // Smaller than the block size, so the composer cannot flush a full block and must carry the
+        // data in its accumulator across the await.
+        let body_size = 512 * KB;
+        // The composer asserts a trailing partial block only occurs at the end of the object, so the
+        // object is exactly one short body: the stream ends right after the carried-across await.
+        let object_size = body_size;
+
+        let pool = PagedPool::config()
+            .with_candidate_sizes([CandidateSize::prunable(block_size)])
+            .with_minimum_memory_limit()
+            .build();
+
+        let mut body = pool.get_buffer_mut(block_size, BufferKind::GetObject, None);
+        let data = vec![0xABu8; body_size];
+        let mut remaining = data.as_slice();
+        body.append_from_slice(&mut remaining);
+        let body = body.into_bytes();
+        assert_eq!(pool.acquired_bytes(BufferKind::GetObject), block_size);
+
+        // Observed when the stream is polled for a second part, i.e. after the composer has taken
+        // the first body and looped back around.
+        let held_at_next_poll = Arc::new(std::sync::Mutex::new(None));
+        let stream = {
+            let pool = pool.clone();
+            let held = held_at_next_poll.clone();
+            futures::stream::unfold(Some(body), move |body| {
+                let pool = pool.clone();
+                let held = held.clone();
+                async move {
+                    match body {
+                        Some(body) => Some((Ok(GetBodyPart { offset: 0, data: body }), None)),
+                        None => {
+                            *held.lock().unwrap() = Some(pool.acquired_bytes(BufferKind::GetObject));
+                            None
+                        }
+                    }
+                }
+            })
+        };
+
+        // Parts pushed to the queue hold their own legitimate reference to the same buffer, which
+        // would mask the accumulator's. Dropping the consumer end makes those pushes no-ops, leaving
+        // the accumulator as the only possible holder.
+        let (part_queue, part_queue_producer) = unbounded_part_queue::<MockClient>();
+        drop(part_queue);
+        let mut composer = CachingPartComposer {
+            part_queue_producer,
+            cache_key: ObjectId::new("object".to_owned(), ETag::for_tests()),
+            original_range: RequestRange::new(object_size, 0, object_size),
+            block_index: 0,
+            block_offset: 0,
+            cache: Arc::new(InMemoryDataCache::new(block_size as u64)),
+            runtime: Runtime::new(ThreadPool::builder().pool_size(1).create().unwrap()),
+        };
+        block_on(composer.compose_parts(stream, RequestRange::new(object_size, 0, object_size))).unwrap();
+
+        assert_eq!(
+            held_at_next_poll
+                .lock()
+                .unwrap()
+                .expect("stream should have been polled twice"),
+            0,
+            "the composer must copy the partial block off its pool buffer before awaiting the next \
+             part, or it pins one part buffer while allocating another",
+        );
     }
 
     fn compare_read<Client: ObjectClient>(id: &ObjectId, object: &MockObject, mut request_task: RequestTask<Client>) {
