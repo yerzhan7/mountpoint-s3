@@ -1395,7 +1395,7 @@ fn concurrent_open_for_write_test(mem_limit: usize) {
         ..Default::default()
     };
     let part_size = test_config.part_size;
-    let max_files = write_buffer_budget_for(mem_limit, part_size) / part_size;
+    let max_files = write_buffer_budget_for(mem_limit, [part_size]) / part_size;
     let test_session = fuse::s3_session::new("concurrent_open_for_write_test", test_config);
 
     let file_names: Vec<_> = (0..max_files).map(|i| format!("file-{i}")).collect();
@@ -1444,7 +1444,7 @@ fn open_for_write_returns_enomem_when_cap_exhausted() {
         ..Default::default()
     };
     let part_size = test_config.part_size;
-    let cap = write_buffer_budget_for(MEM_LIMIT, part_size) / part_size;
+    let cap = write_buffer_budget_for(MEM_LIMIT, [part_size]) / part_size;
     let test_session = fuse::s3_session::new("open_for_write_returns_enomem_when_cap_exhausted", test_config);
 
     // Open `cap` files for write — all should succeed.

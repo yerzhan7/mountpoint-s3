@@ -20,7 +20,7 @@ const READ_CHUNK: usize = 8 * 1024 * 1024;
 /// Setup phase: pin the entire write budget before the reader starts, leaving only the read
 /// reserve (one part) free.
 fn hold(mount_path: &Path) -> Box<dyn SetupGuard> {
-    let held_parts = budget_parts(MINIMUM_MEM_LIMIT, PART_SIZE);
+    let held_parts = budget_parts(MINIMUM_MEM_LIMIT, PART_SIZE, false);
     Box::new(hold_budget_parts(SCOPE, held_parts, mount_path))
 }
 

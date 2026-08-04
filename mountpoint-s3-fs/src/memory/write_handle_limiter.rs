@@ -245,12 +245,24 @@ mod tests {
             pinned_buffers.push(pool.get_buffer_mut(PART_SIZE_8MIB, BufferKind::Append, None));
         }
 
-        // A read can still allocate while all admitted writers hold their buffers.
-        assert!(
-            pool.inner
-                .try_get_buffer(PART_SIZE_8MIB, BufferKind::GetObject, None, false)
-                .is_some(),
-            "a read must still allocate its buffer while all admitted writers hold theirs"
-        );
+        // A read can still allocate while all admitted writers hold their buffers. It goes through
+        // the async path, which is what reaches the reserve: the fast path deliberately cannot, so
+        // that a speculative request can't spend the buffer a blocked read depends on.
+        let read = std::thread::spawn({
+            let pool = pool.clone();
+            move || {
+                futures::executor::block_on(pool.inner.get_buffer_async(PART_SIZE_8MIB, BufferKind::GetObject, None))
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !read.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a read must still allocate its buffer while all admitted writers hold theirs"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let buffer = read.join().expect("read thread should not panic");
+        assert!(buffer.capacity() >= PART_SIZE_8MIB);
     }
 }

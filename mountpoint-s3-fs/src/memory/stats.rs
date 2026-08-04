@@ -6,7 +6,7 @@ use crate::sync::Arc;
 use crate::sync::atomic::{AtomicUsize, Ordering};
 
 use super::buffers::ManagedBuffer;
-use super::limiter::MemoryLimiter;
+use super::limiter::{AllocPolicy, MemoryLimiter};
 
 /// Usage stats for a specific size pool.
 #[derive(Debug)]
@@ -53,9 +53,14 @@ impl SizePoolStats {
         self.empty_pages.fetch_sub(1, Ordering::SeqCst);
     }
 
-    pub(super) fn try_allocate_page(&self, buffer_count: usize, kind: BufferKind) -> Option<ManagedBuffer> {
+    pub(super) fn try_allocate_page(
+        &self,
+        buffer_count: usize,
+        kind: BufferKind,
+        policy: AllocPolicy,
+    ) -> Option<ManagedBuffer> {
         let size = self.buffer_size * buffer_count;
-        let result = self.limiter.try_allocate(size, kind, false, false)?;
+        let result = self.limiter.try_allocate(size, kind, false, policy)?;
         metrics::gauge!(
             "pool.allocated_pages",
             "buffer_size" => format!("{}", self.buffer_size),

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use mountpoint_s3_fs::memory::write_buffer_budget_for;
 
 use super::SetupGuard;
+use crate::common::fuse::TestSessionConfig;
 use crate::stress::test_objects;
 
 const STUB_WRITE: usize = 4 * 1024;
@@ -14,8 +15,16 @@ const STUB_WRITE: usize = 4 * 1024;
 /// Number of full write-part buffers that fit in the write budget at `mem_limit` — i.e. the
 /// concurrent write-handle cap (`WriteHandleLimiter`) and the most parts a [`BudgetHold`] can pin.
 /// Scenarios typically hold `budget_parts(..) - n` to leave `n` parts free.
-pub fn budget_parts(mem_limit: usize, part_size: usize) -> usize {
-    write_buffer_budget_for(mem_limit, part_size) / part_size
+///
+/// `cache` must match the scenario's [`Scenario::cache`](crate::stress::harness::Scenario) flag: a
+/// mount with a disk cache registers the 1 MiB block size as a second prunable size, which reserves
+/// one more buffer and so lowers the write budget.
+pub fn budget_parts(mem_limit: usize, part_size: usize, cache: bool) -> usize {
+    let mut prunable_sizes = vec![part_size];
+    if cache {
+        prunable_sizes.push(TestSessionConfig::default().cache_block_size);
+    }
+    write_buffer_budget_for(mem_limit, prunable_sizes) / part_size
 }
 
 /// A held slice of the data-buffer budget: a set of open write handles, each pinning one

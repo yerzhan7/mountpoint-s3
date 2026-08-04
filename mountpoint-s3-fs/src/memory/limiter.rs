@@ -28,19 +28,52 @@ pub fn data_buffer_budget_for(mem_limit: usize) -> usize {
     mem_limit.saturating_sub(additional_mem_reserved_for(mem_limit))
 }
 
-/// Prunable-sized buffers reserved so prunable allocations aren't starved. A sequential read (the
-/// prunable kind today) holds one part while it prefetches the next.
-const PRUNABLE_RESERVED_PARTS: usize = 1;
+/// Buffers reserved per prunable size so prunable allocations aren't starved. A sequential read
+/// holds one part while it prefetches the next; a cache-hit read holds one block at a time.
+pub(super) const PRUNABLE_RESERVED_BUFFERS_PER_SIZE: usize = 1;
 
-/// The budget reserved for prunable allocations (0 if none is configured).
-fn prunable_reserved_for(prunable_buffer_size: usize) -> usize {
-    prunable_buffer_size * PRUNABLE_RESERVED_PARTS
+/// The budget reserved for prunable allocations: [`PRUNABLE_RESERVED_BUFFERS_PER_SIZE`] buffer for
+/// *each distinct* prunable size (0 if none is configured).
+///
+/// One reserve per size — not one globally sized by the largest prunable size — because the pool is
+/// segregated by buffer size: a request for a 1 MiB cache block can only be served from the 1 MiB
+/// [`SizePool`](super::pool::SizePool), so budget left free for an 8 MiB read part does nothing for
+/// it. Sizes are expected to be deduplicated by the caller (see
+/// [`PagedPoolConfig::with_candidate_sizes`](super::PagedPoolConfig::with_candidate_sizes)).
+pub fn prunable_reserved_for(prunable_buffer_sizes: impl IntoIterator<Item = usize>) -> usize {
+    prunable_buffer_sizes
+        .into_iter()
+        .map(|size| size * PRUNABLE_RESERVED_BUFFERS_PER_SIZE)
+        .sum()
 }
 
 /// The buffer budget available to writes: `data_buffer_budget_for(mem_limit)` minus the prunable
 /// reserve. Source of truth for the write-handle cap (see [`MemoryLimiter::write_buffer_budget`]).
-pub fn write_buffer_budget_for(mem_limit: usize, prunable_buffer_size: usize) -> usize {
-    data_buffer_budget_for(mem_limit).saturating_sub(prunable_reserved_for(prunable_buffer_size))
+pub fn write_buffer_budget_for(mem_limit: usize, prunable_buffer_sizes: impl IntoIterator<Item = usize>) -> usize {
+    data_buffer_budget_for(mem_limit).saturating_sub(prunable_reserved_for(prunable_buffer_sizes))
+}
+
+/// How an allocation is allowed to draw against the memory limit.
+///
+/// See [`MemoryLimiter::try_allocate`] for the ceiling each one applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocPolicy {
+    /// Stop short of the prunable reserve. The policy for all bulk allocations.
+    Normal,
+    /// May consume the prunable reserve. Granted only against a per-size reserve slot.
+    Reserve,
+    /// Bypass the limit check entirely, overshooting `mem_limit` if needed.
+    Forced,
+}
+
+impl AllocPolicy {
+    /// Whether this policy may draw on a prunable reserve slot.
+    ///
+    /// Only requests that have already failed the fast path and are now blocking may: the reserve is
+    /// there to unblock a stalled read, not to raise the ceiling for opportunistic ones.
+    pub fn may_use_reserve(&self) -> bool {
+        matches!(self, AllocPolicy::Reserve | AllocPolicy::Forced)
+    }
 }
 
 /// Buffer areas that can be managed by the memory limiter. This is used for updating metrics.
@@ -113,9 +146,9 @@ pub struct MemoryLimiter {
 }
 
 impl MemoryLimiter {
-    pub fn new(mem_limit: usize, prunable_buffer_size: usize) -> Self {
+    pub fn new(mem_limit: usize, prunable_buffer_sizes: impl IntoIterator<Item = usize>) -> Self {
         let additional_mem_reserved = additional_mem_reserved_for(mem_limit);
-        let prunable_reserved = prunable_reserved_for(prunable_buffer_size);
+        let prunable_reserved = prunable_reserved_for(prunable_buffer_sizes);
         let formatter = make_format(humansize::BINARY);
         debug!(
             "target memory usage is {} with {} reserved memory and {} reserved for prunable buffers",
@@ -156,6 +189,13 @@ impl MemoryLimiter {
     /// always backed by budget and never waits on memory reserved for reads.
     pub fn write_buffer_budget(&self) -> usize {
         self.data_buffer_budget().saturating_sub(self.prunable_reserved)
+    }
+
+    /// Total bytes held back from bulk allocations for prunable buffers: one buffer per distinct
+    /// prunable size. Only [`AllocPolicy::Reserve`] allocations may draw on it.
+    #[cfg(test)]
+    pub(super) fn prunable_reserved(&self) -> usize {
+        self.prunable_reserved
     }
 
     /// Reserve the memory for future uses. Always succeeds, even if it means going beyond
@@ -288,9 +328,18 @@ impl MemoryLimiter {
 
     /// Try to allocate `size` bytes from the pool budget.
     ///
-    /// `kind` selects the ceiling: prunable kinds (see [`BufferKind::is_prunable`]) may use the full
-    /// `mem_limit`, while non-prunable kinds stop `prunable_reserved` bytes short, keeping that slice
-    /// available for prunable allocations.
+    /// `policy` selects the ceiling:
+    /// - [`AllocPolicy::Normal`] — bulk allocations of *every* kind stop `prunable_reserved` bytes
+    ///   short of `mem_limit`, keeping that slice free.
+    /// - [`AllocPolicy::Reserve`] — may use the full `mem_limit`, i.e. dip into the reserved slice.
+    ///   Only granted against a dedicated per-size reserve slot (see
+    ///   [`SizePool::try_acquire`](super::pool::SizePool::try_acquire)), which bounds total reserve
+    ///   use to `prunable_reserved` bytes.
+    /// - [`AllocPolicy::Forced`] — no limit check at all; deliberately overshoots `mem_limit`.
+    ///
+    /// The reserve is *not* open to prunable kinds in general: a prunable page allocation is bulk
+    /// (up to 16 buffers) and would swallow the reserve it is meant to protect, which is exactly how
+    /// cache warmup used to pin the whole budget and stall later cache-block reads.
     ///
     /// `track` controls per-kind byte accounting: `true` records the allocation against `kind` (and
     /// releases it on drop), `false` skips tracking. Page allocations pass `false` because their
@@ -300,18 +349,16 @@ impl MemoryLimiter {
         size: usize,
         kind: BufferKind,
         track: bool,
-        forced: bool,
+        policy: AllocPolicy,
     ) -> Option<ManagedBuffer> {
-        if forced {
+        if let AllocPolicy::Forced = policy {
             self.allocated_bytes.fetch_add(size, Ordering::SeqCst);
             metrics::gauge!("pool.allocated_bytes").increment(size as f64);
         } else {
             let start = Instant::now();
-            // Prunable kinds use the full limit; others must leave `prunable_reserved` bytes free.
-            let ceiling = if kind.is_prunable() {
-                self.mem_limit
-            } else {
-                self.mem_limit.saturating_sub(self.prunable_reserved)
+            let ceiling = match policy {
+                AllocPolicy::Reserve => self.mem_limit,
+                _ => self.mem_limit.saturating_sub(self.prunable_reserved),
             };
             let mut mem_allocated = self.allocated_bytes.load(Ordering::SeqCst);
             loop {

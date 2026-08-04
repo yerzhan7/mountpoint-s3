@@ -25,7 +25,7 @@ const WARMUP_KEYS: &[&str] = &[MEDIUM_READ_OBJECT.key];
 fn setup(mount_path: &Path) -> Box<dyn SetupGuard> {
     warm_cache(WARMUP_KEYS, mount_path);
 
-    let held_parts = budget_parts(MINIMUM_MEM_LIMIT, PART_SIZE);
+    let held_parts = budget_parts(MINIMUM_MEM_LIMIT, PART_SIZE, true);
     Box::new(hold_budget_parts(SCOPE, held_parts, mount_path))
 }
 

@@ -4,11 +4,11 @@ use mountpoint_s3_client::config::{MemoryPool, MetaRequest};
 
 use crate::prefetch::CursorId;
 use crate::sync::thread::{self, JoinHandle};
-use crate::sync::{Arc, RwLock};
+use crate::sync::{Arc, Mutex, RwLock};
 
 use super::allocation_queue::AllocationQueue;
 use super::buffers::{PoolBuffer, PoolBufferMut};
-use super::limiter::{CursorHandle, MemoryLimiter};
+use super::limiter::{AllocPolicy, CursorHandle, MemoryLimiter};
 use super::pages::{MAX_BUFFERS_PER_PAGE, Page, PagedBufferPtr};
 use super::stats::{BufferKind, SizePoolStats};
 
@@ -69,7 +69,10 @@ impl PagedPool {
     /// Create a new [PagedPool] with the given configuration.
     pub fn new(config: &PagedPoolConfig) -> Self {
         let ordered_sizes: &[CandidateSize] = config.ordered_sizes();
-        let limiter = Arc::new(MemoryLimiter::new(config.memory_limit(), config.largest_prunable_size));
+        let limiter = Arc::new(MemoryLimiter::new(
+            config.memory_limit(),
+            config.prunable_sizes.iter().copied(),
+        ));
 
         let inner = Arc::new(PagedPoolInner::new(ordered_sizes, limiter));
 
@@ -123,7 +126,7 @@ impl PagedPool {
 
     fn get_buffer(&self, size: usize, kind: BufferKind, cursor_id: Option<CursorId>) -> PoolBuffer {
         self.inner
-            .try_get_buffer(size, kind, cursor_id, true)
+            .try_get_buffer(size, kind, cursor_id, AllocPolicy::Forced)
             .expect("forced allocations cannot fail")
     }
 
@@ -224,10 +227,7 @@ impl PagedPoolInner {
     pub(super) fn new(ordered_sizes: &[CandidateSize], limiter: Arc<MemoryLimiter>) -> Self {
         let ordered_size_pools = ordered_sizes
             .iter()
-            .map(|candidate| SizePool {
-                pages: Default::default(),
-                stats: Arc::new(SizePoolStats::new(candidate.bytes(), limiter.clone())),
-            })
+            .map(|candidate| SizePool::new(candidate, &limiter))
             .collect();
 
         Self {
@@ -275,10 +275,15 @@ impl PagedPoolInner {
     /// - cursor with an active FUSE read → high priority
     /// - cursor without an active read (speculative prefetch) → low priority
     /// - no cursor (upload) → high priority (write syscall is blocked)
-    async fn get_buffer_async(&self, size: usize, kind: BufferKind, cursor_id: Option<CursorId>) -> PoolBuffer {
+    pub(super) async fn get_buffer_async(
+        &self,
+        size: usize,
+        kind: BufferKind,
+        cursor_id: Option<CursorId>,
+    ) -> PoolBuffer {
         // Fast path: if the queue is empty, try to acquire immediately.
         if !self.allocation_queue.has_pending()
-            && let Some(buffer) = self.try_get_buffer(size, kind, cursor_id, false)
+            && let Some(buffer) = self.try_get_buffer(size, kind, cursor_id, AllocPolicy::Normal)
         {
             return buffer;
         }
@@ -302,7 +307,7 @@ impl PagedPoolInner {
         // Await the buffer from the queue. Err(Canceled) can only happen during pool shutdown.
         // TODO(memory-limiter): signal error to CRT via aws_future_s3_buffer_ticket_set_error.
         rx.await.unwrap_or_else(|_| {
-            self.try_get_buffer(size, kind, cursor_id, true)
+            self.try_get_buffer(size, kind, cursor_id, AllocPolicy::Forced)
                 .expect("forced allocations cannot fail")
         })
     }
@@ -319,16 +324,17 @@ impl PagedPoolInner {
     ///     
     /// Returns `None` if allocating the required memory would exceed the memory limit.
     ///
-    /// **NOTE:** guarantees to return `Some` if invoked with `ignore_limit == true`.
+    /// **NOTE:** guarantees to return `Some` if invoked with `AllocPolicy::Forced`.
     pub(super) fn try_get_buffer(
         &self,
         size: usize,
         kind: BufferKind,
         cursor_id: Option<CursorId>,
-        ignore_limit: bool,
+        policy: AllocPolicy,
     ) -> Option<PoolBuffer> {
-        let buffer = if let Some(pool) = self.get_pool_for_size(size)
-            && let Some(buffer_ptr) = pool.try_acquire(kind)
+        let size_pool = self.get_pool_for_size(size);
+        let buffer = if let Some(pool) = size_pool
+            && let Some(buffer_ptr) = pool.try_acquire(kind, policy)
         {
             metrics::histogram!("pool.acquired_bytes", "type" => "primary", "kind" => kind.as_str())
                 .record(size as f64);
@@ -339,7 +345,17 @@ impl PagedPoolInner {
         } else {
             metrics::histogram!("pool.acquired_bytes", "type" => "secondary", "kind" => kind.as_str())
                 .record(size as f64);
-            PoolBuffer::try_new_secondary(size, kind, self.limiter.clone(), ignore_limit)?
+            // A poolable size already has a dedicated reserve page to fall back on, so letting its
+            // secondary buffers spend the reserve too would double-count it. Sizes with no
+            // `SizePool` (`0`, or above `MAX_BUFFER_SIZE`) are only ever served from secondary, so
+            // for them the reserve *is* the fallback and a prunable request may spend it — bounded
+            // by the limiter's byte accounting, which admits at most `prunable_reserved` bytes above
+            // the normal ceiling.
+            let policy = match policy {
+                AllocPolicy::Reserve if size_pool.is_some() || !kind.is_prunable() => AllocPolicy::Normal,
+                policy => policy,
+            };
+            PoolBuffer::try_new_secondary(size, kind, self.limiter.clone(), policy)?
         };
         self.limiter.on_pool_acquire(size, cursor_id);
         Some(buffer)
@@ -397,12 +413,15 @@ impl PagedPoolInner {
     ///
     /// Called whenever memory is freed — on buffer drop, cursor release, or pool trim.
     /// Loops until no more entries can be fulfilled or the queue is empty.
+    ///
+    /// Queued waiters allocate with [`AllocPolicy::Reserve`]: a request that has already failed the
+    /// fast path and is now blocking a FUSE read is exactly what the reserve exists for. The fast
+    /// path in [`Self::get_buffer_async`] stays on [`AllocPolicy::Normal`] so unqueued traffic can't
+    /// nibble at the reserve.
     fn process_pending(&self) {
-        while self
-            .allocation_queue
-            .try_fulfill_front(|pending| self.try_get_buffer(pending.size, pending.kind, pending.cursor_id, false))
-        {
-        }
+        while self.allocation_queue.try_fulfill_front(|pending| {
+            self.try_get_buffer(pending.size, pending.kind, pending.cursor_id, AllocPolicy::Reserve)
+        }) {}
     }
 
     /// Spawn a background thread to process pending allocation requests.
@@ -425,17 +444,34 @@ impl PagedPoolInner {
 }
 
 #[derive(Debug)]
-struct SizePool {
+pub(super) struct SizePool {
     pages: RwLock<Vec<Page>>,
     stats: Arc<SizePoolStats>,
+    /// This size's reserve: a dedicated single-buffer page that bulk allocations can't consume, and
+    /// that only prunable kinds may acquire from. `None` for non-prunable sizes, which have no
+    /// reserve.
+    ///
+    /// Deliberately held here rather than in `pages` so the normal page scan can't hand its buffer
+    /// to a non-prunable kind, and `trim` can't free it out from under the accounting. Because at
+    /// most one buffer per size is ever allocated under [`AllocPolicy::Reserve`], total reserve use
+    /// is bounded by `prunable_reserved` — the same figure the write-handle cap is derived from.
+    reserve: Option<Mutex<Option<Page>>>,
 }
 
 impl SizePool {
+    fn new(candidate: &CandidateSize, limiter: &Arc<MemoryLimiter>) -> Self {
+        Self {
+            pages: Default::default(),
+            stats: Arc::new(SizePoolStats::new(candidate.bytes(), limiter.clone())),
+            reserve: candidate.is_prunable().then(Default::default),
+        }
+    }
+
     /// Acquire an unused buffer from an existing page if available, or
     /// from a newly allocated page.
     ///
     /// Returns `None` if allocating a new page would hit the memory limit.
-    fn try_acquire(&self, kind: BufferKind) -> Option<PagedBufferPtr> {
+    fn try_acquire(&self, kind: BufferKind, policy: AllocPolicy) -> Option<PagedBufferPtr> {
         {
             // Fast path: reserve a buffer from the existing pages (under a read lock).
             let read_pages = self.pages.read().unwrap();
@@ -455,10 +491,11 @@ impl SizePool {
 
         tracing::trace!(size = self.stats.buffer_size, "allocate new memory pool page");
         // Try to allocate a new page with the maximum buffer count first. If there is not enough
-        // memory, keep retrying by halving the count.
+        // memory, keep retrying by halving the count. Every attempt here is a bulk allocation, so
+        // none of them may touch the prunable reserve.
         let mut buffer_count = MAX_BUFFERS_PER_PAGE;
         while buffer_count > 0 {
-            let Some(page) = Page::try_new(&self.stats, buffer_count, kind) else {
+            let Some(page) = Page::try_new(&self.stats, buffer_count, kind, AllocPolicy::Normal) else {
                 buffer_count /= 2;
                 continue;
             };
@@ -467,7 +504,43 @@ impl SizePool {
             write_pages.push(page);
             return Some(buffer_ptr);
         }
-        None
+
+        // Even a one-buffer page does not fit under the normal ceiling. Fall back to this size's
+        // reserve, so a prunable read of this size can always make progress no matter how much
+        // budget other kinds — or bulk pages of this same size — have pinned.
+        drop(write_pages);
+        self.try_acquire_from_reserve(kind, policy)
+    }
+
+    /// Acquire this size's reserve buffer, allocating the reserve page on first use.
+    ///
+    /// Only prunable kinds are eligible: the reserve exists so reads and cache-block reads can't be
+    /// starved by writes, and handing it to a write would defeat that. And only [`AllocPolicy`]s that
+    /// permit it may draw on the reserve, so a speculative fast-path request cannot spend the buffer
+    /// that a blocked, already-queued read is counting on.
+    fn try_acquire_from_reserve(&self, kind: BufferKind, policy: AllocPolicy) -> Option<PagedBufferPtr> {
+        if !kind.is_prunable() || !policy.may_use_reserve() {
+            return None;
+        }
+        let mut reserve = self.reserve.as_ref()?.lock().unwrap();
+        let page = match &*reserve {
+            Some(page) => page,
+            None => reserve.insert(Page::try_new(
+                &self.stats,
+                super::limiter::PRUNABLE_RESERVED_BUFFERS_PER_SIZE,
+                kind,
+                AllocPolicy::Reserve,
+            )?),
+        };
+        let buffer_ptr = page.try_acquire(kind)?;
+        tracing::debug!(
+            size = self.stats.buffer_size,
+            ?kind,
+            "acquired a buffer from the prunable reserve"
+        );
+        metrics::counter!("pool.reserve_acquisitions", "buffer_size" => format!("{}", self.stats.buffer_size), "kind" => kind.as_str())
+            .increment(1);
+        Some(buffer_ptr)
     }
 
     fn try_get_buffer_ptr<'a>(
@@ -523,7 +596,9 @@ impl CandidateSize {
 #[derive(Debug, Clone)]
 pub struct PagedPoolConfig {
     ordered_sizes: Vec<CandidateSize>,
-    largest_prunable_size: usize,
+    /// Distinct prunable sizes, deduplicated. One reserve buffer is held back per entry.
+    /// Includes sizes above [MAX_BUFFER_SIZE], which get no [SizePool] but still need a reserve.
+    prunable_sizes: Vec<usize>,
     mem_limit: usize,
     maintenance_interval: Duration,
 }
@@ -532,7 +607,7 @@ impl Default for PagedPoolConfig {
     fn default() -> Self {
         Self {
             ordered_sizes: Default::default(),
-            largest_prunable_size: 0,
+            prunable_sizes: Default::default(),
             mem_limit: MINIMUM_MEM_LIMIT,
             maintenance_interval: Duration::from_secs(60),
         }
@@ -549,17 +624,19 @@ impl PagedPoolConfig {
         I: IntoIterator<Item = CandidateSize>,
     {
         let mut sizes: Vec<CandidateSize> = buffer_sizes.into_iter().collect();
-        self.largest_prunable_size = sizes
-            .iter()
-            .filter(|s| s.prunable && s.bytes > 0)
-            .map(|s| s.bytes)
-            .max()
-            .unwrap_or(0);
-        sizes.retain(|s| s.bytes > 0 && s.bytes <= MAX_BUFFER_SIZE);
         // Sort by size; keep a prunable candidate ahead of a non-prunable one of the same size so
         // dedup (which keeps the first) preserves prunability when sizes coincide.
         sizes.sort_by(|a, b| a.bytes.cmp(&b.bytes).then(b.prunable.cmp(&a.prunable)));
         sizes.dedup_by_key(|s| s.bytes);
+        // Reserve one buffer per distinct prunable size. Computed before the MAX_BUFFER_SIZE filter
+        // below: an oversized prunable candidate is served from secondary memory rather than a
+        // `SizePool`, but it still needs its bytes held back.
+        self.prunable_sizes = sizes
+            .iter()
+            .filter(|s| s.prunable && s.bytes > 0)
+            .map(|s| s.bytes)
+            .collect();
+        sizes.retain(|s| s.bytes > 0 && s.bytes <= MAX_BUFFER_SIZE);
         self.ordered_sizes = sizes;
         self
     }
@@ -747,9 +824,11 @@ mod tests {
         assert_eq!(ordered_bytes.len(), unique.len(), "Sizes should be unique");
     }
 
-    /// The reserve is sized from the *largest prunable* candidate, ignoring non-prunable sizes.
+    /// The reserve is one buffer per *distinct prunable* size, ignoring non-prunable sizes. Every
+    /// prunable size needs its own, because a pool only serves requests of its own buffer size:
+    /// budget left free for an 8 MiB read part cannot satisfy a 1 MiB cache block.
     #[test]
-    fn largest_prunable_candidate_sizes_the_reserve() {
+    fn every_prunable_candidate_gets_a_reserve_buffer() {
         const READ: usize = 256 * 1024;
         const CACHE: usize = 1024 * 1024;
         const WRITE: usize = 8 * 1024 * 1024;
@@ -763,8 +842,104 @@ mod tests {
             ])
             .with_memory_limit(MEM_LIMIT)
             .build();
-        // Reserve is the max prunable size (CACHE), not the max overall size (WRITE) nor the read.
-        assert_eq!(pool.write_buffer_budget(), data_budget - CACHE);
+        // Both prunable sizes are reserved for; the non-prunable WRITE is not.
+        assert_eq!(pool.write_buffer_budget(), data_budget - READ - CACHE);
+    }
+
+    /// Sizes are deduplicated before the reserve is computed, so a read part that equals the write
+    /// part is reserved for exactly once — the shared pool needs one spare buffer, not two.
+    #[test]
+    fn duplicate_prunable_candidates_are_reserved_for_once() {
+        const PART: usize = 8 * 1024 * 1024;
+        const CACHE: usize = 1024 * 1024;
+        const MEM_LIMIT: usize = 512 * 1024 * 1024;
+        let data_budget = MEM_LIMIT - 128 * 1024 * 1024;
+
+        let read_eq_write = PagedPool::config()
+            .with_candidate_sizes([
+                CandidateSize::prunable(CACHE),
+                CandidateSize::prunable(PART),
+                CandidateSize::new(PART),
+            ])
+            .with_memory_limit(MEM_LIMIT)
+            .build();
+        assert_eq!(read_eq_write.write_buffer_budget(), data_budget - PART - CACHE);
+
+        // Without a cache there is no 1 MiB size to reserve for, so the budget is one buffer higher.
+        let no_cache = PagedPool::config()
+            .with_candidate_sizes([CandidateSize::prunable(PART), CandidateSize::new(PART)])
+            .with_memory_limit(MEM_LIMIT)
+            .build();
+        assert_eq!(no_cache.write_buffer_budget(), data_budget - PART);
+    }
+
+    /// Regression test for the `cache_hit_vs_miss_held_budget` stall: cache warmup fills the whole
+    /// data budget with 8 MiB prunable read pages, then writers pin every buffer on those pages so
+    /// no page can ever be trimmed. A 1 MiB cache-block read arriving afterwards must still get a
+    /// buffer from the 1 MiB reserve instead of queueing forever.
+    #[test]
+    fn cache_block_reserve_survives_prunable_pages_pinned_by_writes() {
+        const CACHE: usize = 1024 * 1024;
+        const PART: usize = 8 * 1024 * 1024;
+        const MEM_LIMIT: usize = 512 * 1024 * 1024;
+        let pool = PagedPool::config()
+            .with_candidate_sizes([CandidateSize::prunable(CACHE), CandidateSize::prunable(PART)])
+            .with_memory_limit(MEM_LIMIT)
+            .build();
+        assert_eq!(
+            pool.inner.limiter().prunable_reserved(),
+            CACHE + PART,
+            "each prunable size reserves exactly one buffer"
+        );
+
+        // Warmup: fill the budget with 8 MiB read parts, which allocate 16-buffer pages.
+        let mut warmup = Vec::new();
+        while let Some(buffer) = pool
+            .inner
+            .try_get_buffer(PART, BufferKind::GetObject, None, AllocPolicy::Normal)
+        {
+            warmup.push(buffer);
+        }
+        assert!(!warmup.is_empty(), "warmup should have allocated at least one page");
+
+        // Hand every one of those buffers to a writer, so the pages can never be trimmed. Dropping
+        // the read buffers and re-acquiring as `Append` keeps the same pages alive and pinned.
+        let mut held: Vec<_> = warmup
+            .drain(..)
+            .filter_map(|read_buffer| {
+                drop(read_buffer);
+                pool.inner
+                    .try_get_buffer(PART, BufferKind::Append, None, AllocPolicy::Normal)
+            })
+            .collect();
+        assert!(!held.is_empty(), "writers should have pinned the warmed pages");
+
+        // 8 MiB pages leave slack too small for another part but large enough for 1 MiB pages, so
+        // exhaust that too — bulk allocation must run completely dry before the reserve is the only
+        // thing left.
+        while let Some(buffer) = pool
+            .inner
+            .try_get_buffer(CACHE, BufferKind::DiskCache, None, AllocPolicy::Normal)
+        {
+            held.push(buffer);
+        }
+        assert!(!pool.inner.trim(), "pinned pages must not be trimmable");
+
+        // But the queued cache-block read reaches the 1 MiB reserve and makes progress. This is the
+        // path `process_pending` takes for a waiter that has already failed the fast path.
+        let cache_block = pool
+            .inner
+            .try_get_buffer(CACHE, BufferKind::DiskCache, None, AllocPolicy::Reserve)
+            .expect("cache-block read must reach its own reserve while 8 MiB pages are pinned");
+        assert!(cache_block.capacity() >= CACHE);
+
+        // A write must never reach the reserve, however desperate.
+        assert!(
+            pool.inner
+                .try_get_buffer(PART, BufferKind::Append, None, AllocPolicy::Reserve)
+                .is_none(),
+            "a non-prunable kind must never consume the prunable reserve"
+        );
     }
 
     /// A prunable candidate larger than [MAX_BUFFER_SIZE] is dropped from `ordered_sizes` (served
@@ -811,7 +986,10 @@ mod tests {
 
             // Fill all available memory.
             let mut blockers = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+            while let Some(buffer) = pool
+                .inner
+                .try_get_buffer(BUF, BufferKind::Other, None, AllocPolicy::Normal)
+            {
                 blockers.push(buffer);
             }
 
@@ -841,7 +1019,10 @@ mod tests {
 
             // Fill memory and enqueue a waiter.
             let mut blockers = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+            while let Some(buffer) = pool
+                .inner
+                .try_get_buffer(BUF, BufferKind::Other, None, AllocPolicy::Normal)
+            {
                 blockers.push(buffer);
             }
             let pool_clone = pool.clone();
@@ -873,7 +1054,10 @@ mod tests {
             let pool = tight_pool(BUF);
 
             let mut blockers = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+            while let Some(buffer) = pool
+                .inner
+                .try_get_buffer(BUF, BufferKind::Other, None, AllocPolicy::Normal)
+            {
                 blockers.push(buffer);
             }
 
@@ -904,7 +1088,10 @@ mod tests {
 
             // Fill all memory.
             let mut blockers = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+            while let Some(buffer) = pool
+                .inner
+                .try_get_buffer(BUF, BufferKind::Other, None, AllocPolicy::Normal)
+            {
                 blockers.push(buffer);
             }
 
@@ -948,7 +1135,10 @@ mod tests {
 
             // Fill all memory.
             let mut blockers = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+            while let Some(buffer) = pool
+                .inner
+                .try_get_buffer(BUF, BufferKind::Other, None, AllocPolicy::Normal)
+            {
                 blockers.push(buffer);
             }
 
@@ -1006,7 +1196,10 @@ mod tests {
 
                 // Fill memory leaving exactly one free buffer slot.
                 let mut blockers = Vec::new();
-                while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+                while let Some(buffer) = pool
+                    .inner
+                    .try_get_buffer(BUF, BufferKind::Other, None, AllocPolicy::Normal)
+                {
                     blockers.push(buffer);
                 }
                 let budget_buffers = blockers.len();
@@ -1068,31 +1261,112 @@ mod tests {
             // Fill the budget with non-read (upload) buffers. The reduced ceiling
             // (mem_limit - BUF) stops them one buffer short of the full budget.
             let mut writes = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Append, None, false) {
+            while let Some(buffer) = pool
+                .inner
+                .try_get_buffer(BUF, BufferKind::Append, None, AllocPolicy::Normal)
+            {
                 writes.push(buffer);
             }
 
-            // A further non-read allocation is denied — the last slice is off-limits to writes.
+            // A further non-read allocation is denied — the last slice is off-limits to writes, even
+            // when the write is the one blocked and asking for the reserve.
             assert!(
                 pool.inner
-                    .try_get_buffer(BUF, BufferKind::PutObject, None, false)
+                    .try_get_buffer(BUF, BufferKind::PutObject, None, AllocPolicy::Normal)
                     .is_none(),
                 "non-read allocation must not consume the read-reserved slice"
             );
+            assert!(
+                pool.inner
+                    .try_get_buffer(BUF, BufferKind::PutObject, None, AllocPolicy::Reserve)
+                    .is_none(),
+                "the reserve must stay off-limits to non-prunable kinds"
+            );
 
-            // But prunable allocations (reads and disk-cache read-backs) can still claim the slice.
+            // Nor may a prunable allocation take it on the fast path: an opportunistic prefetch must
+            // not spend the buffer an already-blocked read is waiting on.
             assert!(
                 pool.inner
-                    .try_get_buffer(BUF, BufferKind::GetObject, None, false)
-                    .is_some(),
-                "read allocation must succeed into the reserved slice"
+                    .try_get_buffer(BUF, BufferKind::GetObject, None, AllocPolicy::Normal)
+                    .is_none(),
+                "the fast path must not consume the reserve"
             );
+
+            // But a blocked prunable allocation (a read, or a disk-cache read-back) claims the slice.
+            // This is the policy `process_pending` retries queued waiters under.
+            let read = pool
+                .inner
+                .try_get_buffer(BUF, BufferKind::GetObject, None, AllocPolicy::Reserve)
+                .expect("a queued read must reach the reserved slice");
+            drop(read);
             assert!(
                 pool.inner
-                    .try_get_buffer(BUF, BufferKind::DiskCache, None, false)
+                    .try_get_buffer(BUF, BufferKind::DiskCache, None, AllocPolicy::Reserve)
                     .is_some(),
-                "disk-cache allocation must succeed into the reserved slice"
+                "a queued disk-cache read must reach the reserved slice"
             );
+        }
+
+        /// A waiter must not be blocked by an unservable waiter ahead of it in the queue. Sizes are
+        /// independent resources — an 8 MiB read with no free 8 MiB slot cannot stall a 1 MiB
+        /// cache-block read whose own pool has a buffer available. This is the second half of the
+        /// `cache_hit_vs_miss_held_budget` stall: without it, the per-size reserve exists but the
+        /// queue never offers it to the request that needs it.
+        #[test]
+        fn a_waiter_is_not_blocked_by_an_unservable_waiter_ahead_of_it() {
+            const CACHE: usize = 1024 * 1024;
+            const PART: usize = 8 * CACHE;
+            const MEM_LIMIT: usize = 512 * 1024 * 1024;
+            let pool = PagedPool::config()
+                .with_candidate_sizes([CandidateSize::prunable(CACHE), CandidateSize::prunable(PART)])
+                .with_memory_limit(MEM_LIMIT)
+                .build();
+
+            // Spend all bulk budget on buffers writers hold, so nothing can be trimmed or pruned.
+            let mut held = Vec::new();
+            for size in [PART, CACHE] {
+                while let Some(buffer) = pool
+                    .inner
+                    .try_get_buffer(size, BufferKind::Append, None, AllocPolicy::Normal)
+                {
+                    held.push(buffer);
+                }
+            }
+            // Take the 8 MiB reserve too, so an 8 MiB waiter cannot be served by any means.
+            let part_reserve = pool
+                .inner
+                .try_get_buffer(PART, BufferKind::GetObject, None, AllocPolicy::Reserve)
+                .expect("the part-size reserve should be available");
+
+            // An 8 MiB read queues first and cannot be served; a 1 MiB cache read queues behind it.
+            let blocked = std::thread::spawn({
+                let pool = pool.clone();
+                move || futures::executor::block_on(pool.inner.get_buffer_async(PART, BufferKind::GetObject, None))
+            });
+            while !pool.inner.is_memory_pressure() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let behind = std::thread::spawn({
+                let pool = pool.clone();
+                move || futures::executor::block_on(pool.inner.get_buffer_async(CACHE, BufferKind::DiskCache, None))
+            });
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !behind.is_finished() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the 1 MiB waiter must be served from its own reserve rather than waiting behind \
+                     the unservable 8 MiB waiter"
+                );
+                sleep(Duration::from_millis(10));
+            }
+            assert!(behind.join().expect("waiter thread should not panic").capacity() >= CACHE);
+
+            // The 8 MiB waiter is still queued; releasing the part reserve lets it through.
+            assert!(!blocked.is_finished(), "the 8 MiB waiter should still be queued");
+            drop(part_reserve);
+            let buffer = blocked.join().expect("waiter thread should not panic");
+            assert!(buffer.capacity() >= PART);
         }
     }
 }
