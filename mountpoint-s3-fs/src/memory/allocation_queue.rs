@@ -56,7 +56,7 @@ impl PendingAllocation {
 ///
 /// This queue does not allocate buffers or check available memory — it only manages
 /// ordering, signaling, and lifecycle. The pool drives the wake loop by calling
-/// [`pop_front_if`](Self::pop_front_if) with a predicate (e.g., `can_allocate`),
+/// [`try_fulfill_front`](Self::try_fulfill_front) with a predicate (e.g., `can_allocate`),
 /// then performing the allocation and delivering the buffer via the entry's sender.
 pub struct AllocationQueue {
     /// Queue state protected by a mutex.
@@ -71,6 +71,29 @@ struct AllocationQueueInner {
     high: VecDeque<PendingAllocation>,
     /// Low-priority requests (speculative prefetch). Served when high is empty.
     low: VecDeque<PendingAllocation>,
+}
+
+/// Which of [`AllocationQueueInner`]'s two lanes to operate on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    High,
+    Low,
+}
+
+impl AllocationQueueInner {
+    fn lane(&self, lane: Lane) -> &VecDeque<PendingAllocation> {
+        match lane {
+            Lane::High => &self.high,
+            Lane::Low => &self.low,
+        }
+    }
+
+    fn lane_mut(&mut self, lane: Lane) -> &mut VecDeque<PendingAllocation> {
+        match lane {
+            Lane::High => &mut self.high,
+            Lane::Low => &mut self.low,
+        }
+    }
 }
 
 impl std::fmt::Debug for AllocationQueue {
@@ -145,19 +168,19 @@ impl AllocationQueue {
         receiver
     }
 
-    /// Fullfil the pending allocation at the front of the queue using the result of `try_get_buffer`.
+    /// Fullfil the first pending allocation that `try_get_buffer` can satisfy.
     ///
-    /// Returns `false` if the queue was empty or `try_get_buffer` returned `None`.
+    /// Returns `false` if the queue was empty or no entry could be satisfied.
     ///
     /// Skips (and removes) cancelled entries in the queue.
-    pub fn try_fulfill_front(&self, try_get_buffer: impl FnOnce(&PendingAllocation) -> Option<PoolBuffer>) -> bool {
+    pub fn try_fulfill_front(&self, mut try_get_buffer: impl FnMut(&PendingAllocation) -> Option<PoolBuffer>) -> bool {
         if !self.has_pending() {
             return false;
         }
 
         // TODO(memory-limiter): consider refactoring or inlining try_front_if.
         let mut buffer = None;
-        let entry = self.pop_front_if(|pending| {
+        let entry = self.pop_first_satisfiable(|pending| {
             buffer = try_get_buffer(pending);
             buffer.is_some()
         });
@@ -175,40 +198,63 @@ impl AllocationQueue {
         }
     }
 
-    /// Atomically peeks at the front entry and removes it if `predicate` returns `true`.
+    /// Atomically finds the first entry `predicate` accepts and removes it.
     ///
-    /// Checks the high-priority list first, then low. Cancelled entries (where the
-    /// receiver was dropped) are pruned from the front of each queue before checking
-    /// the predicate — this prevents a large cancelled entry from blocking smaller
-    /// live entries behind it.
+    /// Walks high-priority entries before low ones, and in FIFO order within each lane, so priority
+    /// still decides *who is offered memory first*. But an entry the predicate rejects does not block
+    /// the ones behind it: the pool is segregated by buffer size, so whether a request can be served
+    /// depends on its size, not only on its position. An 8 MiB read waiting for a free 8 MiB slot must
+    /// not stall a 1 MiB cache-block read whose own pool has a buffer ready — that is head-of-line
+    /// blocking across independent resources, and it deadlocks whenever the larger size can only be
+    /// freed by work that is itself behind the smaller request.
     ///
-    /// Returns `None` if both queues are empty or the predicate returns `false`.
+    /// Cancelled entries (where the receiver was dropped) are pruned as they are encountered.
+    ///
+    /// The scan is bounded: entries are only *offered* to the predicate once per distinct
+    /// `(size, kind)` pair, since two requests with the same pair either both succeed or both fail.
+    /// So the cost is the number of distinct sizes in flight, not the queue length.
+    ///
+    /// Returns `None` if both queues are empty or the predicate rejected every entry.
     /// Sets `has_pending` to `false` if both queues become empty after removal.
-    fn pop_front_if(&self, predicate: impl FnOnce(&PendingAllocation) -> bool) -> Option<PendingAllocation> {
+    fn pop_first_satisfiable(
+        &self,
+        mut predicate: impl FnMut(&PendingAllocation) -> bool,
+    ) -> Option<PendingAllocation> {
         let mut inner = self.inner.lock().unwrap();
 
-        // Prune cancelled entries from the front of each queue.
-        while inner.high.front().is_some_and(|e| e.sender.is_canceled()) {
-            inner.high.pop_front();
-        }
-        while inner.low.front().is_some_and(|e| e.sender.is_canceled()) {
-            inner.low.pop_front();
+        let mut attempted: Vec<(usize, BufferKind)> = Vec::new();
+        for lane in [Lane::High, Lane::Low] {
+            let mut index = 0;
+            while index < inner.lane(lane).len() {
+                let entry = &inner.lane(lane)[index];
+                if entry.sender.is_canceled() {
+                    inner.lane_mut(lane).remove(index);
+                    continue;
+                }
+
+                let key = (entry.size, entry.kind);
+                if attempted.contains(&key) {
+                    // An identical request was already refused this round; this one would be too.
+                    index += 1;
+                    continue;
+                }
+
+                if predicate(entry) {
+                    let entry = inner.lane_mut(lane).remove(index);
+                    if inner.high.is_empty() && inner.low.is_empty() {
+                        self.has_pending.store(false, Ordering::SeqCst);
+                    }
+                    return entry;
+                }
+                attempted.push(key);
+                index += 1;
+            }
         }
 
-        let front = inner.high.front().or_else(|| inner.low.front());
-        let Some(front) = front else {
-            self.has_pending.store(false, Ordering::SeqCst);
-            return None;
-        };
-
-        if !predicate(front) {
-            return None;
-        }
-        let entry = inner.high.pop_front().or_else(|| inner.low.pop_front());
         if inner.high.is_empty() && inner.low.is_empty() {
             self.has_pending.store(false, Ordering::SeqCst);
         }
-        entry
+        None
     }
 
     /// Moves all entries for `cursor_id` from the low-priority queue to the back
@@ -293,7 +339,7 @@ mod tests {
         let queue = AllocationQueue::new();
         let rx = queue.push_high(Some(CursorId::new_from_raw(1)), 1024, BufferKind::GetObject);
 
-        let entry = queue.pop_front_if(always).unwrap();
+        let entry = queue.pop_first_satisfiable(always).unwrap();
         assert!(!queue.has_pending());
 
         let buffer = make_buffer(entry.size);
@@ -308,7 +354,7 @@ mod tests {
         let queue = AllocationQueue::new();
         let _rx = queue.push_high(Some(CursorId::new_from_raw(1)), 1024, BufferKind::GetObject);
 
-        let result = queue.pop_front_if(|_pending| false);
+        let result = queue.pop_first_satisfiable(|_pending| false);
         assert!(result.is_none());
         assert!(queue.has_pending()); // still there
     }
@@ -320,7 +366,7 @@ mod tests {
         let _rx_low = queue.push_low(CursorId::new_from_raw(1), 1024, BufferKind::GetObject);
         let _rx_high = queue.push_high(Some(CursorId::new_from_raw(2)), 1024, BufferKind::GetObject);
 
-        let entry = queue.pop_front_if(always).unwrap();
+        let entry = queue.pop_first_satisfiable(always).unwrap();
         assert_eq!(entry.cursor_id, Some(CursorId::new_from_raw(2))); // high first
     }
 
@@ -331,8 +377,8 @@ mod tests {
         let _rx1 = queue.push_high(Some(CursorId::new_from_raw(1)), 1024, BufferKind::GetObject);
         let _rx2 = queue.push_high(Some(CursorId::new_from_raw(2)), 1024, BufferKind::GetObject);
 
-        let first = queue.pop_front_if(always).unwrap();
-        let second = queue.pop_front_if(always).unwrap();
+        let first = queue.pop_first_satisfiable(always).unwrap();
+        let second = queue.pop_first_satisfiable(always).unwrap();
         assert_eq!(first.cursor_id, Some(CursorId::new_from_raw(1)));
         assert_eq!(second.cursor_id, Some(CursorId::new_from_raw(2)));
     }
@@ -348,7 +394,7 @@ mod tests {
 
         queue.upgrade(cursor_a);
 
-        let entry = queue.pop_front_if(always).unwrap();
+        let entry = queue.pop_first_satisfiable(always).unwrap();
         assert_eq!(entry.cursor_id, Some(cursor_a)); // upgraded, served first
     }
 
@@ -364,12 +410,12 @@ mod tests {
 
         queue.upgrade(cursor);
 
-        let e1 = queue.pop_front_if(always).unwrap();
-        let e2 = queue.pop_front_if(always).unwrap();
+        let e1 = queue.pop_first_satisfiable(always).unwrap();
+        let e2 = queue.pop_first_satisfiable(always).unwrap();
         assert_eq!(e1.cursor_id, Some(cursor));
         assert_eq!(e2.cursor_id, Some(cursor));
 
-        let e3 = queue.pop_front_if(always).unwrap();
+        let e3 = queue.pop_first_satisfiable(always).unwrap();
         assert_eq!(e3.cursor_id, Some(other));
     }
 
@@ -385,10 +431,10 @@ mod tests {
         queue.upgrade(cursor);
 
         // Upload is still first (was already high), then promoted read
-        let e1 = queue.pop_front_if(always).unwrap();
+        let e1 = queue.pop_first_satisfiable(always).unwrap();
         assert_eq!(e1.cursor_id, None); // upload, still at front of high
 
-        let e2 = queue.pop_front_if(always).unwrap();
+        let e2 = queue.pop_first_satisfiable(always).unwrap();
         assert_eq!(e2.cursor_id, Some(cursor)); // promoted read, back of high
     }
 
@@ -401,7 +447,7 @@ mod tests {
 
         drop(rx_large);
 
-        let entry = queue.pop_front_if(|pending| pending.size <= 1024 * 1024);
+        let entry = queue.pop_first_satisfiable(|pending| pending.size <= 1024 * 1024);
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().cursor_id, Some(CursorId::new_from_raw(2)));
     }
@@ -409,7 +455,7 @@ mod tests {
     #[test]
     fn test_pop_front_if_empty_queue() {
         let queue = AllocationQueue::new();
-        assert!(queue.pop_front_if(always).is_none());
+        assert!(queue.pop_first_satisfiable(always).is_none());
         assert!(!queue.has_pending());
     }
 
@@ -419,7 +465,7 @@ mod tests {
         let rx = queue.push_high(Some(CursorId::new_from_raw(1)), 1024, BufferKind::GetObject);
         drop(rx);
 
-        let entry = queue.pop_front_if(always);
+        let entry = queue.pop_first_satisfiable(always);
         assert!(entry.is_none());
         assert!(!queue.has_pending());
     }
