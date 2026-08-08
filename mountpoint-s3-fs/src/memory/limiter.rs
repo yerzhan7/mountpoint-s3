@@ -389,8 +389,12 @@ impl MemoryLimiter {
     pub fn deallocate(&self, ptr: BufferPtr, kind: Option<BufferKind>) {
         let size = ptr.size();
         drop(ptr);
-        self.allocated_bytes.fetch_sub(size, Ordering::SeqCst);
+        // Lower the gauge *before* releasing the bytes in `allocated_bytes`. An allocation that
+        // only fits because of this free must not be able to increment the gauge while this
+        // decrement is still pending, or the gauge peaks above the ceiling the limiter enforces —
+        // reporting an overshoot that never happened.
         metrics::gauge!("pool.allocated_bytes").decrement(size as f64);
+        self.allocated_bytes.fetch_sub(size, Ordering::SeqCst);
         if let Some(kind) = kind {
             self.release_bytes(size, kind);
         } else {
