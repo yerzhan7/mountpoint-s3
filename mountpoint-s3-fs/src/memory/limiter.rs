@@ -43,6 +43,20 @@ pub fn write_buffer_budget_for(mem_limit: usize, prunable_buffer_size: usize) ->
     data_buffer_budget_for(mem_limit).saturating_sub(prunable_reserved_for(prunable_buffer_size))
 }
 
+/// What an allocation commits its memory to.
+///
+/// This is what decides whether an allocation may draw on the prunable reserve — see
+/// [`MemoryLimiter::allocation_ceiling`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Commitment {
+    /// A page in a [`SizePool`](super::pool::SizePool). Its memory stays committed to that one size
+    /// tier for the pool's lifetime: [`trim`](super::PagedPool::trim) frees a page only once every
+    /// buffer on it is free, and until then any [`BufferKind`] may claim a buffer inside it.
+    Tier,
+    /// An exact-size one-off allocation, freed on drop and never cached in a size tier.
+    OneOff,
+}
+
 /// Buffer areas that can be managed by the memory limiter. This is used for updating metrics.
 #[derive(Debug)]
 pub enum BufferArea {
@@ -286,19 +300,50 @@ impl MemoryLimiter {
         metrics::gauge!("mem.bytes_reserved", "area" => BufferArea::Prefetch.as_str()).decrement(decremented as f64);
     }
 
+    /// The ceiling [`Self::try_allocate`] enforces for the given `kind` and `commitment`.
+    ///
+    /// Every allocation stops `prunable_reserved` bytes short of `mem_limit` — that slice is the
+    /// headroom that lets a read still allocate when writes have taken the rest of the budget — with
+    /// one exception: a prunable ([`BufferKind::is_prunable`]) [`Commitment::OneOff`] allocation may
+    /// spend it. Such an allocation *is* the read the reserve exists for, and it takes the reserve in
+    /// the only shape that gives it back: an exact-size buffer, freed on drop.
+    ///
+    /// Withholding the reserve from [`Commitment::Tier`] allocations is what keeps it reachable. A
+    /// page holds up to [`MAX_BUFFERS_PER_PAGE`](super::pages::MAX_BUFFERS_PER_PAGE) buffers and is
+    /// freed only when wholly empty, while any [`BufferKind`] may claim a free buffer inside it. So a
+    /// page carved out of the reserve destroys it: the bytes stay committed to that one size tier,
+    /// where a non-prunable holder can pin them indefinitely.
+    ///
+    /// Concretely, at `--memory-target 512 MiB` (384 MiB data budget, 8 MiB reserve) cache-warmup
+    /// reads filled the 8 MiB tier across all 384 MiB; the writers then pinned a buffer in every
+    /// page, so no page was empty to trim, and a 1 MiB `DiskCache` read — which needs a page in the
+    /// 1 MiB tier — could never allocate. Capping tier allocations at `mem_limit - prunable_reserved`
+    /// leaves the reserve unallocated for whichever prunable request needs it next, in whatever size,
+    /// and the one-off exception is what lets that request take it without re-committing it to a tier.
+    ///
+    /// This is exact, not approximate: the ceiling is a function of `prunable_reserved` (itself
+    /// [`PRUNABLE_RESERVED_PARTS`] x the largest prunable candidate size) and the request's kind and
+    /// commitment — no estimate of demand, or of the pool's page layout, is involved.
+    fn allocation_ceiling(&self, kind: BufferKind, commitment: Commitment) -> usize {
+        if kind.is_prunable() && commitment == Commitment::OneOff {
+            self.mem_limit
+        } else {
+            self.mem_limit.saturating_sub(self.prunable_reserved)
+        }
+    }
+
     /// Try to allocate `size` bytes from the pool budget.
     ///
-    /// `kind` selects the ceiling: prunable kinds (see [`BufferKind::is_prunable`]) may use the full
-    /// `mem_limit`, while non-prunable kinds stop `prunable_reserved` bytes short, keeping that slice
-    /// available for prunable allocations.
+    /// `kind` and `commitment` select the ceiling — see [`Self::allocation_ceiling`].
     ///
     /// `track` controls per-kind byte accounting: `true` records the allocation against `kind` (and
     /// releases it on drop), `false` skips tracking. Page allocations pass `false` because their
     /// individual buffers are tracked separately as they are acquired.
-    pub fn try_allocate(
+    pub(super) fn try_allocate(
         self: &Arc<Self>,
         size: usize,
         kind: BufferKind,
+        commitment: Commitment,
         track: bool,
         forced: bool,
     ) -> Option<ManagedBuffer> {
@@ -307,12 +352,7 @@ impl MemoryLimiter {
             metrics::gauge!("pool.allocated_bytes").increment(size as f64);
         } else {
             let start = Instant::now();
-            // Prunable kinds use the full limit; others must leave `prunable_reserved` bytes free.
-            let ceiling = if kind.is_prunable() {
-                self.mem_limit
-            } else {
-                self.mem_limit.saturating_sub(self.prunable_reserved)
-            };
+            let ceiling = self.allocation_ceiling(kind, commitment);
             let mut mem_allocated = self.allocated_bytes.load(Ordering::SeqCst);
             loop {
                 let new_mem_allocated = mem_allocated.saturating_add(size);

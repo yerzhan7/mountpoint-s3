@@ -6,7 +6,7 @@ use bytes::Bytes;
 
 use crate::sync::Arc;
 
-use super::limiter::MemoryLimiter;
+use super::limiter::{Commitment, MemoryLimiter};
 use super::pages::PagedBufferPtr;
 use super::stats::BufferKind;
 
@@ -38,9 +38,13 @@ impl PoolBuffer {
         limiter: Arc<MemoryLimiter>,
         forced: bool,
     ) -> Option<Self> {
-        Some(Self(PoolBufferInner::Secondary(
-            limiter.try_allocate(size, kind, true, forced)?,
-        )))
+        Some(Self(PoolBufferInner::Secondary(limiter.try_allocate(
+            size,
+            kind,
+            Commitment::OneOff,
+            true,
+            forced,
+        )?)))
     }
 
     pub fn capacity(&self) -> usize {
