@@ -200,6 +200,10 @@ impl MemoryLimiter {
     }
 
     /// Release all remaining reservation for a cursor and remove it from tracking.
+    ///
+    /// Runs from [`CursorState::drop`], so it can fire on any thread that holds the last strong
+    /// reference. It takes a `cursors` shard *write* lock, which means no caller may be holding a
+    /// guard into `cursors` — see [`Self::live_cursors`].
     fn release_cursor(&self, cursor_id: CursorId, cursor_reserved: &AtomicUsize) {
         if self.cursors.remove(&cursor_id).is_some() {
             let remaining = cursor_reserved.swap(0, Ordering::SeqCst);
@@ -413,14 +417,31 @@ impl MemoryLimiter {
         &self.pruning_signal
     }
 
+    /// Snapshot strong references to every live cursor, holding no `cursors` guard on return.
+    ///
+    /// **Never drop an upgraded `Arc<CursorState>` while iterating `cursors` directly.** A
+    /// [`DashMap`] iterator holds a read guard on the shard it is walking, and the last strong
+    /// reference going away runs [`CursorState::drop`] -> [`Self::release_cursor`] ->
+    /// `cursors.remove`, which asks for that same shard's *write* lock. The shard locks are not
+    /// reentrant, so the caller would deadlock against itself: an owner dropping its handle
+    /// between our `upgrade()` and the end of the iteration step is enough to trigger it, and it
+    /// wedges the maintenance thread permanently (leaking that cursor's reservation with it).
+    /// Collecting first moves the references out of the iteration, so any of them can be dropped
+    /// safely once every guard is released.
+    fn live_cursors(&self) -> Vec<Arc<CursorState>> {
+        // Moving each `Arc` into the `Vec` never drops one, so this is safe to build under the
+        // iterator's guards.
+        self.cursors
+            .iter()
+            .filter_map(|entry| entry.value().upgrade())
+            .collect()
+    }
+
     /// Returns `true` if any cursor is currently servicing a FUSE read.
     pub(super) fn has_active_reads(&self) -> bool {
-        self.cursors.iter().any(|entry| {
-            entry
-                .value()
-                .upgrade()
-                .is_some_and(|state| matches!(*state.read_state.lock().unwrap(), ReadState::Active { .. }))
-        })
+        self.live_cursors()
+            .iter()
+            .any(|state| matches!(*state.read_state.lock().unwrap(), ReadState::Active { .. }))
     }
 
     /// Reset the least-recently-read idle cursor.
@@ -428,10 +449,9 @@ impl MemoryLimiter {
     /// Returns `true` if a cursor was reset.
     pub(super) fn reset_one_idle_cursor(&self) -> bool {
         let lru = self
-            .cursors
+            .live_cursors()
             .iter()
-            .filter_map(|entry| {
-                let state = entry.value().upgrade()?;
+            .filter_map(|state| {
                 let tick = match *state.read_state.lock().unwrap() {
                     ReadState::Active { .. } => return None,
                     ReadState::Last { tick } => tick,
@@ -460,10 +480,9 @@ impl MemoryLimiter {
     ///
     /// Returns `true` if a window was cleared and freed at least one byte.
     pub(super) fn clear_one_seek_window(&self) -> bool {
-        for entry in self.cursors.iter() {
-            let Some(state) = entry.value().upgrade() else {
-                continue;
-            };
+        // Snapshot first: the callback below runs arbitrary cursor code (dropping part buffers),
+        // which must not happen under a `cursors` shard guard. See [`Self::live_cursors`].
+        for state in self.live_cursors() {
             if !matches!(*state.read_state.lock().unwrap(), ReadState::Active { .. }) {
                 continue;
             }
