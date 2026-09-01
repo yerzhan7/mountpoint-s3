@@ -16,9 +16,10 @@ const ALLOCATED_MEMORY_METRIC: &str = "pool.allocated_bytes";
 const IN_USE_MEMORY_METRIC: &str = "pool.bytes_in_use";
 
 /// Maximum number of buffers that memory metrics may transiently overshoot the budget by.
-/// For `pool.allocated_bytes` this is due to forced allocations during cancellation fallback
-/// (see `MemoryLimiter::deallocate`). For `pool.bytes_in_use` this is due to concurrent
-/// release/acquire races (see `MemoryLimiter::release_bytes`).
+/// Both gauges are updated after their underlying counter, so a concurrent allocation can reuse
+/// freed bytes and increment the gauge before the release decrements it — see
+/// `MemoryLimiter::deallocate` for `pool.allocated_bytes` and `MemoryLimiter::release_bytes`
+/// for `pool.bytes_in_use`.
 const MAX_OVERSHOOT_BUFFERS: usize = 1;
 
 /// A gauge handle carrying its identity for logging and violation messages.
@@ -148,9 +149,8 @@ fn collect_gauges_by_label(
 /// Assert each memory gauge's peak stayed within the effective budget the limiter enforces
 /// against (`mem_limit - additional_mem_reserved`). Reservations may transiently overshoot, so
 /// `mem.bytes_reserved` is only logged. The pool metrics (`pool.allocated_bytes` and
-/// `pool.bytes_in_use`) allow a small tolerance for transient overshoots (forced allocations
-/// during cancellation fallback and concurrent release/acquire races respectively) but
-/// otherwise fail the assertion if exceeded.
+/// `pool.bytes_in_use`) allow a small tolerance for the transient overshoots their
+/// gauge updates can race into, but otherwise fail the assertion if exceeded.
 pub fn assert_peak_reserved_invariant(scenario_name: &str, mem_limit: f64, part_size: usize) {
     let Some(recorder) = stress_recorder::recorder() else {
         tracing::warn!(
@@ -176,8 +176,8 @@ pub fn assert_peak_reserved_invariant(scenario_name: &str, mem_limit: f64, part_
     }
 
     // Both pool.allocated_bytes and pool.bytes_in_use may transiently overshoot the budget:
-    // - pool.allocated_bytes: forced allocations during cancellation fallback bypass budget
-    //   checks (see MemoryLimiter::deallocate)
+    // - pool.allocated_bytes: the counter is decremented before the gauge, so a concurrent
+    //   allocation can reuse the bytes in between (see MemoryLimiter::deallocate)
     // - pool.bytes_in_use: concurrent release/acquire race in bitmask clearing
     //   (see MemoryLimiter::release_bytes)
     // Allow a small tolerance to avoid test flakiness while still catching real regressions.
@@ -204,7 +204,7 @@ pub fn assert_peak_reserved_invariant(scenario_name: &str, mem_limit: f64, part_
         tracing::warn!(
             scenario = scenario_name,
             warnings = ?allocated_warnings,
-            "stress: {} peak exceeded budget (within tolerance — likely forced allocation during cancellation)",
+            "stress: {} peak exceeded budget (within tolerance — likely a gauge update racing a release)",
             ALLOCATED_MEMORY_METRIC,
         );
     }

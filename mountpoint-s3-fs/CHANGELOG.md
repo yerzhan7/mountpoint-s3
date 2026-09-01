@@ -1,5 +1,7 @@
 ## Unreleased
 
+* Remove `PagedPool::get_buffer_mut`, which allocated past the configured memory limit when the pool had no free buffer. Every allocation now respects the limit: use `PagedPool::get_buffer_mut_async` to wait for memory, or `PagedPool::try_get_buffer_mut` to take a buffer only if one is available right now.
+
 ## v0.11.0 (August 24, 2026)
 
 * `S3FilesystemConfig::read_only` is now enforced by the file system, which refuses operations that would modify the mount with the new `InodeError::ReadOnlyMount` (`EROFS`) instead of relying on the kernel to do so. `FuseOptions::read_only` is now also accepted with a `MountPoint::FileDescriptor` mount point, where it records that the caller performed the mount read-only. `MountpointConfig::create_fuse_session` now fails if `FuseOptions::read_only` and `S3FilesystemConfig::read_only` disagree. ([#1939](https://github.com/awslabs/mountpoint-s3/pull/1939))

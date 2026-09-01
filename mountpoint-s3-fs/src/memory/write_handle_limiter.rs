@@ -243,13 +243,16 @@ mod tests {
         let mut pinned_buffers = Vec::new();
         for _ in 0..write_limiter.max_concurrent_writes() {
             slots.push(write_limiter.try_acquire().expect("acquire should succeed within cap"));
-            pinned_buffers.push(pool.get_buffer_mut(PART_SIZE_8MIB, BufferKind::Append, None));
+            pinned_buffers.push(
+                pool.try_get_buffer_mut(PART_SIZE_8MIB, BufferKind::Append, None)
+                    .expect("every admitted writer must fit in the budget"),
+            );
         }
 
         // A read can still allocate while all admitted writers hold their buffers.
         assert!(
             pool.inner
-                .try_get_buffer(PART_SIZE_8MIB, BufferKind::GetObject, None, false)
+                .try_get_buffer(PART_SIZE_8MIB, BufferKind::GetObject, None)
                 .is_some(),
             "a read must still allocate its buffer while all admitted writers hold theirs"
         );

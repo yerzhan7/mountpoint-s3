@@ -102,15 +102,9 @@ impl PagedPool {
         self.inner.limiter.total_acquired_bytes()
     }
 
-    /// Get a new empty mutable buffer from the pool with the requested capacity.
-    /// If `cursor_id` is provided, `on_pool_acquire` will decrement the limiter's
-    /// reservation counters for per-cursor memory tracking.
-    pub fn get_buffer_mut(&self, capacity: usize, kind: BufferKind, cursor_id: Option<CursorId>) -> PoolBufferMut {
-        let buffer = self.get_buffer(capacity, kind, cursor_id);
-        PoolBufferMut::new(buffer)
-    }
-
-    /// Async equivalent of [Self::get_buffer_mut]
+    /// Get a new empty mutable buffer from the pool with the requested capacity, waiting for
+    /// memory to become available if necessary. If `cursor_id` is provided, `on_pool_acquire`
+    /// will decrement the limiter's reservation counters for per-cursor memory tracking.
     pub async fn get_buffer_mut_async(
         &self,
         capacity: usize,
@@ -129,8 +123,7 @@ impl PagedPool {
     ///
     /// Returns `None` when the allocation queue is non-empty — so an opportunistic caller can never
     /// jump ahead of a reader or writer already parked in either lane — or when serving the request
-    /// would exceed the memory limit. Unlike [Self::get_buffer_mut] this never forces an over-limit
-    /// allocation, and unlike [Self::get_buffer_mut_async] it never parks the caller.
+    /// would exceed the memory limit. Unlike [Self::get_buffer_mut_async] it never parks the caller.
     pub fn try_get_buffer_mut(
         &self,
         capacity: usize,
@@ -141,14 +134,8 @@ impl PagedPool {
             return None;
         }
         self.inner
-            .try_get_buffer(capacity, kind, cursor_id, false)
+            .try_get_buffer(capacity, kind, cursor_id)
             .map(PoolBufferMut::new)
-    }
-
-    fn get_buffer(&self, size: usize, kind: BufferKind, cursor_id: Option<CursorId>) -> PoolBuffer {
-        self.inner
-            .try_get_buffer(size, kind, cursor_id, true)
-            .expect("forced allocations cannot fail")
     }
 
     #[cfg(test)]
@@ -318,7 +305,7 @@ impl PagedPoolInner {
     ) -> Result<PoolBuffer, Cancellation> {
         // Fast path: if the queue is empty, try to acquire immediately.
         if !self.allocation_queue.has_pending()
-            && let Some(buffer) = self.try_get_buffer(size, kind, cursor_id, false)
+            && let Some(buffer) = self.try_get_buffer(size, kind, cursor_id)
         {
             return Ok(buffer);
         }
@@ -340,15 +327,18 @@ impl PagedPoolInner {
 
         match rx.await {
             Ok(buffer) => Ok(buffer),
-            // Reservation cancelled while queued: abandon it so the CRT bridge leaves its
-            // already-errored ticket future untouched, avoiding a wasted allocation.
-            Err(_) if token.is_some_and(|token| token.is_cancelled()) => Err(Cancellation),
-            // Unreachable: `rx` only errors if its `Sender` is dropped, but a parked caller keeps
-            // the pool (and its queue) alive, and the cancelled case is handled above. Force-allocate
-            // defensively so callers without a token never observe `Err`.
-            Err(_) => Ok(self
-                .try_get_buffer(size, kind, cursor_id, true)
-                .expect("forced allocations cannot fail")),
+            // `rx` only errors if the queue dropped our entry's `Sender`, and it only drops a live
+            // entry whose token reports cancelled (see `PendingAllocation::is_abandoned`) — a parked
+            // caller keeps both the pool and its receiver alive. So this is the cancellation case:
+            // abandon the reservation, leaving the CRT bridge's already-errored ticket future
+            // untouched and avoiding an allocation for a request that no longer wants it.
+            Err(_) => {
+                debug_assert!(
+                    token.is_some_and(|token| token.is_cancelled()),
+                    "allocation queue dropped the sender for a reservation that was not cancelled",
+                );
+                Err(Cancellation)
+            }
         }
     }
 
@@ -363,14 +353,11 @@ impl PagedPoolInner {
     ///   - Try to allocate and return a single buffer.
     ///
     /// Returns `None` if allocating the required memory would exceed the memory limit.
-    ///
-    /// **NOTE:** guarantees to return `Some` if invoked with `ignore_limit == true`.
     pub(super) fn try_get_buffer(
         &self,
         size: usize,
         kind: BufferKind,
         cursor_id: Option<CursorId>,
-        ignore_limit: bool,
     ) -> Option<PoolBuffer> {
         let buffer = if let Some(pool) = self.get_pool_for_size(size)
             && let Some(buffer_ptr) = pool.try_acquire(kind)
@@ -384,7 +371,7 @@ impl PagedPoolInner {
         } else {
             metrics::histogram!("pool.acquired_bytes", "type" => "secondary", "kind" => kind.as_str())
                 .record(size as f64);
-            PoolBuffer::try_new_secondary(size, kind, self.limiter.clone(), ignore_limit)?
+            PoolBuffer::try_new_secondary(size, kind, self.limiter.clone())?
         };
         self.limiter.on_pool_acquire(size, cursor_id);
         Some(buffer)
@@ -445,9 +432,8 @@ impl PagedPoolInner {
     fn process_pending(&self) {
         while self
             .allocation_queue
-            .try_fulfill_front(|pending| self.try_get_buffer(pending.size, pending.kind, pending.cursor_id, false))
-        {
-        }
+            .try_fulfill_front(|pending| self.try_get_buffer(pending.size, pending.kind, pending.cursor_id))
+        {}
     }
 
     /// Spawn a background thread to process pending allocation requests.
@@ -670,7 +656,10 @@ mod tests {
     use test_case::{test_case, test_matrix};
 
     fn copy_from_slice(pool: &PagedPool, original: &[u8]) -> Bytes {
-        let mut buffer = pool.get_buffer(original.len(), BufferKind::Other, None);
+        let mut buffer = pool
+            .inner
+            .try_get_buffer(original.len(), BufferKind::Other, None)
+            .expect("pool has room");
         buffer.as_mut().clone_from_slice(original);
         buffer.into_bytes()
     }
@@ -769,7 +758,12 @@ mod tests {
         let mut buffers = Vec::new();
         for (&kind, &count) in &reservations {
             for _ in 0..count {
-                buffers.push(pool.get_buffer(buffer_size, kind, None).into_bytes());
+                buffers.push(
+                    pool.inner
+                        .try_get_buffer(buffer_size, kind, None)
+                        .expect("pool has room")
+                        .into_bytes(),
+                );
             }
         }
 
@@ -856,7 +850,7 @@ mod tests {
 
             // Fill all available memory.
             let mut blockers = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None) {
                 blockers.push(buffer);
             }
 
@@ -890,7 +884,7 @@ mod tests {
 
             // Fill memory and enqueue a waiter.
             let mut blockers = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None) {
                 blockers.push(buffer);
             }
             let pool_clone = pool.clone();
@@ -926,7 +920,7 @@ mod tests {
             let pool = tight_pool(BUF);
 
             let mut blockers = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None) {
                 blockers.push(buffer);
             }
 
@@ -962,7 +956,7 @@ mod tests {
 
             // Fill all memory.
             let mut blockers = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None) {
                 blockers.push(buffer);
             }
 
@@ -1009,7 +1003,7 @@ mod tests {
 
             // Fill all memory.
             let mut blockers = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None) {
                 blockers.push(buffer);
             }
 
@@ -1068,7 +1062,7 @@ mod tests {
 
                 // Fill memory leaving exactly one free buffer slot.
                 let mut blockers = Vec::new();
-                while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+                while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None) {
                     blockers.push(buffer);
                 }
                 let budget_buffers = blockers.len();
@@ -1126,7 +1120,7 @@ mod tests {
 
             // Fill all available memory so further requests must queue.
             let mut blockers = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None, false) {
+            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Other, None) {
                 blockers.push(buffer);
             }
 
@@ -1202,29 +1196,23 @@ mod tests {
             // Fill the budget with non-read (upload) buffers. The reduced ceiling
             // (mem_limit - BUF) stops them one buffer short of the full budget.
             let mut writes = Vec::new();
-            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Append, None, false) {
+            while let Some(buffer) = pool.inner.try_get_buffer(BUF, BufferKind::Append, None) {
                 writes.push(buffer);
             }
 
             // A further non-read allocation is denied — the last slice is off-limits to writes.
             assert!(
-                pool.inner
-                    .try_get_buffer(BUF, BufferKind::PutObject, None, false)
-                    .is_none(),
+                pool.inner.try_get_buffer(BUF, BufferKind::PutObject, None).is_none(),
                 "non-read allocation must not consume the read-reserved slice"
             );
 
             // But prunable allocations (reads and disk-cache read-backs) can still claim the slice.
             assert!(
-                pool.inner
-                    .try_get_buffer(BUF, BufferKind::GetObject, None, false)
-                    .is_some(),
+                pool.inner.try_get_buffer(BUF, BufferKind::GetObject, None).is_some(),
                 "read allocation must succeed into the reserved slice"
             );
             assert!(
-                pool.inner
-                    .try_get_buffer(BUF, BufferKind::DiskCache, None, false)
-                    .is_some(),
+                pool.inner.try_get_buffer(BUF, BufferKind::DiskCache, None).is_some(),
                 "disk-cache allocation must succeed into the reserved slice"
             );
         }

@@ -312,41 +312,31 @@ impl MemoryLimiter {
     /// [`BufferKind`] and released on drop — and `None` for a page in a
     /// [`SizePool`](super::pool::SizePool), whose individual buffers are tracked separately as they
     /// are acquired. It also selects the ceiling; see [`Self::allocation_ceiling`].
-    pub(super) fn try_allocate(
-        self: &Arc<Self>,
-        size: usize,
-        kind: Option<BufferKind>,
-        forced: bool,
-    ) -> Option<ManagedBuffer> {
-        if forced {
-            self.allocated_bytes.fetch_add(size, Ordering::SeqCst);
-            metrics::gauge!("pool.allocated_bytes").increment(size as f64);
-        } else {
-            let start = Instant::now();
-            let ceiling = self.allocation_ceiling(kind);
-            let mut mem_allocated = self.allocated_bytes.load(Ordering::SeqCst);
-            loop {
-                let new_mem_allocated = mem_allocated.saturating_add(size);
-                let new_total_mem_usage = new_mem_allocated.saturating_add(self.additional_mem_reserved);
-                if new_total_mem_usage > ceiling {
-                    trace!(new_total_mem_usage, "not enough memory to allocate");
+    pub(super) fn try_allocate(self: &Arc<Self>, size: usize, kind: Option<BufferKind>) -> Option<ManagedBuffer> {
+        let start = Instant::now();
+        let ceiling = self.allocation_ceiling(kind);
+        let mut mem_allocated = self.allocated_bytes.load(Ordering::SeqCst);
+        loop {
+            let new_mem_allocated = mem_allocated.saturating_add(size);
+            let new_total_mem_usage = new_mem_allocated.saturating_add(self.additional_mem_reserved);
+            if new_total_mem_usage > ceiling {
+                trace!(new_total_mem_usage, "not enough memory to allocate");
+                metrics::histogram!("pool.allocate_latency_us").record(start.elapsed().as_micros() as f64);
+                return None;
+            }
+            // Check that the value we have read is still the same before updating it
+            match self.allocated_bytes.compare_exchange_weak(
+                mem_allocated,
+                new_mem_allocated,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    metrics::gauge!("pool.allocated_bytes").increment(size as f64);
                     metrics::histogram!("pool.allocate_latency_us").record(start.elapsed().as_micros() as f64);
-                    return None;
+                    break;
                 }
-                // Check that the value we have read is still the same before updating it
-                match self.allocated_bytes.compare_exchange_weak(
-                    mem_allocated,
-                    new_mem_allocated,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
-                    Ok(_) => {
-                        metrics::gauge!("pool.allocated_bytes").increment(size as f64);
-                        metrics::histogram!("pool.allocate_latency_us").record(start.elapsed().as_micros() as f64);
-                        break;
-                    }
-                    Err(current) => mem_allocated = current, // another thread updated the atomic before us, trying again
-                }
+                Err(current) => mem_allocated = current, // another thread updated the atomic before us, trying again
             }
         }
 
@@ -357,8 +347,9 @@ impl MemoryLimiter {
         Some(ManagedBuffer::new(size, kind, self.clone()))
     }
 
-    /// Deallocate a buffer. Note: `pool.allocated_bytes` may transiently exceed the budget due to
-    /// forced allocations (e.g., during cancellation fallback) that bypass budget checks.
+    /// Deallocate a buffer. Note: the `pool.allocated_bytes` gauge may transiently exceed
+    /// [`Self::allocation_ceiling`] because the counter is decremented before the gauge, so a
+    /// concurrent allocation can reuse the bytes and increment the gauge in between.
     pub fn deallocate(&self, ptr: BufferPtr, kind: Option<BufferKind>) {
         let size = ptr.size();
         drop(ptr);
@@ -709,7 +700,9 @@ mod tests {
         assert_eq!(limiter.mem_reserved.load(Ordering::SeqCst), 1024);
 
         // Pool allocation triggers on_reserve callback, decrementing mem_reserved
-        let _buffer = pool.get_buffer_mut(1024, BufferKind::GetObject, Some(cursor.id()));
+        let _buffer = pool
+            .try_get_buffer_mut(1024, BufferKind::GetObject, Some(cursor.id()))
+            .expect("pool has room");
         assert_eq!(limiter.mem_reserved.load(Ordering::SeqCst), 0);
     }
 
@@ -724,7 +717,9 @@ mod tests {
         assert_eq!(limiter.mem_reserved.load(Ordering::SeqCst), 2048);
 
         // Pool allocates 1024 — callback decrements both global and per-cursor
-        let _buffer = pool.get_buffer_mut(1024, BufferKind::GetObject, Some(cursor.id()));
+        let _buffer = pool
+            .try_get_buffer_mut(1024, BufferKind::GetObject, Some(cursor.id()))
+            .expect("pool has room");
         assert_eq!(limiter.mem_reserved.load(Ordering::SeqCst), 1024);
 
         // dropping the cursor releases the remaining per-cursor balance (2048 - 1024 = 1024)
@@ -791,7 +786,9 @@ mod tests {
         assert!(!limiter.cursors.contains_key(&cursor_id));
 
         // Late allocation for the cancelled request — cursor is gone
-        let _buffer = pool.get_buffer_mut(1024, BufferKind::GetObject, Some(cursor_id));
+        let _buffer = pool
+            .try_get_buffer_mut(1024, BufferKind::GetObject, Some(cursor_id))
+            .expect("pool has room");
 
         // mem_reserved should stay at 0, not go negative or wrap
         assert_eq!(limiter.mem_reserved.load(Ordering::SeqCst), 0);
@@ -812,7 +809,9 @@ mod tests {
 
         // Pool allocates 1024 — on_pool_acquire should saturate at 512 (not underflow)
         let cursor_id = cursor.id();
-        let _buffer = pool.get_buffer_mut(1024, BufferKind::GetObject, Some(cursor_id));
+        let _buffer = pool
+            .try_get_buffer_mut(1024, BufferKind::GetObject, Some(cursor_id))
+            .expect("pool has room");
         assert_eq!(limiter.mem_reserved.load(Ordering::SeqCst), 0);
 
         // dropping the cursor should subtract 0 (the per-cursor counter is already 0)
@@ -843,7 +842,9 @@ mod tests {
         assert_eq!(limiter.acquired_bytes(BufferKind::GetObject), 0);
 
         // Acquire buffer from the pool (on_pool_acquire converts intent to pool stats)
-        let buffer = pool.get_buffer_mut(buffer_size, BufferKind::GetObject, Some(cursor.id()));
+        let buffer = pool
+            .try_get_buffer_mut(buffer_size, BufferKind::GetObject, Some(cursor.id()))
+            .expect("pool has room");
         assert_eq!(limiter.mem_reserved.load(Ordering::SeqCst), 0);
         assert_eq!(limiter.acquired_bytes(BufferKind::GetObject), buffer_size);
         assert_eq!(
@@ -871,7 +872,9 @@ mod tests {
         assert_eq!(limiter.mem_reserved.load(Ordering::SeqCst), 0);
 
         // Upload allocates without cursor_id — should not touch mem_reserved
-        let buffer = pool.get_buffer_mut(buffer_size, BufferKind::Append, None);
+        let buffer = pool
+            .try_get_buffer_mut(buffer_size, BufferKind::Append, None)
+            .expect("pool has room");
         assert_eq!(limiter.mem_reserved.load(Ordering::SeqCst), 0);
 
         // But available_mem should decrease (pool stats increased)
