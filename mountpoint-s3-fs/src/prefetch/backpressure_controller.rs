@@ -184,10 +184,16 @@ impl BackpressureController {
                 self.next_read_offset = offset + length as u64;
                 let remaining_window = self.read_window_end_offset.saturating_sub(self.next_read_offset) as usize;
 
-                // Increment the read window only if the remaining window reaches some threshold i.e. half of it left.
+                // Top up the read window as soon as the remaining window has shrunk by about one part
+                // size, so that the producer is fed at a steady rate. Only extending the window after
+                // half of it was consumed makes the producer fetch in half-window bursts, which for
+                // large windows leaves the network idle between bursts and lets the part queue run dry
+                // while a burst is still in flight. For small windows (up to 2x part size) keep the
+                // half-window threshold to avoid over-fetching on short-lived cursors (e.g. random reads).
                 // When memory is low the `preferred_read_window_size` will be scaled down so we have to keep trying
                 // until we have enough read window.
-                while remaining_window < (self.preferred_read_window_size / 2)
+                let hysteresis = (self.preferred_read_window_size / 2).min(self.min_read_window_size);
+                while remaining_window < self.preferred_read_window_size.saturating_sub(hysteresis)
                     && self.read_window_end_offset < self.request_end_offset
                 {
                     let new_read_window_end_offset_preferred = self

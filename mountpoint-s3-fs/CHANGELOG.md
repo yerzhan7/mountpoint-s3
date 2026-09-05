@@ -1,5 +1,7 @@
 ## Unreleased
 
+* Improve sequential read throughput by extending the prefetcher's read window continuously (about one part size at a time) instead of in half-window bursts. Large sequential reads previously fetched from S3 in bursts of up to half the read window (up to 1 GiB), leaving the network idle between bursts and allowing reads to stall while the next burst was still in flight.
+
 ## v0.11.0 (August 24, 2026)
 
 * `S3FilesystemConfig::read_only` is now enforced by the file system, which refuses operations that would modify the mount with the new `InodeError::ReadOnlyMount` (`EROFS`) instead of relying on the kernel to do so. `FuseOptions::read_only` is now also accepted with a `MountPoint::FileDescriptor` mount point, where it records that the caller performed the mount read-only. `MountpointConfig::create_fuse_session` now fails if `FuseOptions::read_only` and `S3FilesystemConfig::read_only` disagree. ([#1939](https://github.com/awslabs/mountpoint-s3/pull/1939))
