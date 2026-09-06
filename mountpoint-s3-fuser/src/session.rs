@@ -11,7 +11,7 @@ use nix::unistd::geteuid;
 use std::fmt;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::{io, ops::DerefMut};
@@ -66,6 +66,9 @@ pub struct Session<FS: Filesystem> {
     pub(crate) initialized: AtomicBool,
     /// True if the filesystem was destroyed (destroy operation done)
     pub(crate) destroyed: AtomicBool,
+    /// Payload buffer size an io_uring ring entry must register, derived from the values negotiated
+    /// in FUSE_INIT. Only meaningful once [`Session::initialized`] is set.
+    pub(crate) uring_payload_size: AtomicUsize,
 }
 
 impl<FS: Filesystem> AsFd for Session<FS> {
@@ -119,6 +122,7 @@ impl<FS: Filesystem> Session<FS> {
             proto_minor: AtomicU32::new(0),
             initialized: AtomicBool::new(false),
             destroyed: AtomicBool::new(false),
+            uring_payload_size: AtomicUsize::new(0),
         })
     }
 
@@ -136,6 +140,7 @@ impl<FS: Filesystem> Session<FS> {
             proto_minor: AtomicU32::new(0),
             initialized: AtomicBool::new(false),
             destroyed: AtomicBool::new(false),
+            uring_payload_size: AtomicUsize::new(0),
         }
     }
 
@@ -239,6 +244,17 @@ impl<FS: Filesystem> Session<FS> {
     /// Returns an object that can be used to send notifications to the kernel
     pub fn notifier(&self) -> Notifier {
         Notifier::new(self.ch.sender())
+    }
+
+    /// Whether FUSE_INIT has been negotiated yet.
+    pub fn is_initialized(&self) -> bool {
+        self.initialized.load(Ordering::SeqCst)
+    }
+
+    /// Payload buffer size an io_uring ring entry must register. Only meaningful once
+    /// [`Session::is_initialized`] returns true.
+    pub fn uring_payload_size(&self) -> usize {
+        self.uring_payload_size.load(Ordering::SeqCst)
     }
 }
 

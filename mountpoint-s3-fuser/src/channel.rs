@@ -92,18 +92,40 @@ impl Channel {
     pub fn sender(&self) -> ChannelSender {
         // Since write/writev syscalls are threadsafe, we can simply create
         // a sender by using the same file and use it in other threads.
-        ChannelSender(self.0.clone())
+        ChannelSender(SenderKind::Classic(self.0.clone()))
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct ChannelSender(Arc<File>);
+pub struct ChannelSender(SenderKind);
+
+/// Where a reply goes. The classic transport writes it back to `/dev/fuse`; the io_uring transport
+/// copies it into the ring entry the request arrived on, and the owning worker commits it.
+#[derive(Clone, Debug)]
+enum SenderKind {
+    Classic(Arc<File>),
+    #[cfg(target_os = "linux")]
+    Uring(crate::uring::UringSender),
+}
+
+impl ChannelSender {
+    /// Create a sender that replies through an io_uring ring entry.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn uring(sender: crate::uring::UringSender) -> Self {
+        Self(SenderKind::Uring(sender))
+    }
+}
 
 impl ReplySender for ChannelSender {
     fn send(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<()> {
+        let file = match &self.0 {
+            SenderKind::Classic(file) => file,
+            #[cfg(target_os = "linux")]
+            SenderKind::Uring(sender) => return sender.send(bufs),
+        };
         let rc = unsafe {
             libc::writev(
-                self.0.as_raw_fd(),
+                file.as_raw_fd(),
                 bufs.as_ptr() as *const libc::iovec,
                 bufs.len() as c_int,
             )
@@ -118,6 +140,13 @@ impl ReplySender for ChannelSender {
 
     #[cfg(feature = "abi-7-40")]
     fn open_backing(&self, fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
-        BackingId::create(&self.0, fd)
+        match &self.0 {
+            SenderKind::Classic(file) => BackingId::create(file, fd),
+            #[cfg(target_os = "linux")]
+            SenderKind::Uring(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "passthrough is not supported over io_uring",
+            )),
+        }
     }
 }

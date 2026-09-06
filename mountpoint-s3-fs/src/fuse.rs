@@ -21,6 +21,8 @@ use fuser::{
 
 pub mod config;
 pub mod session;
+#[cfg(target_os = "linux")]
+pub mod uring;
 
 /// A trait that can be implemented to log errors returned by fuse operations.
 pub trait ErrorLogger: std::fmt::Debug {

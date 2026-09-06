@@ -227,6 +227,35 @@ where
             );
         }
 
+        #[cfg(target_os = "linux")]
+        {
+            let uring = crate::fuse::uring::UringSettings::from_env();
+            if uring.enabled {
+                // The kernel only delivers requests over io_uring if we ask for it here, and it
+                // sizes the ring's payload buffers from the `max_write` we negotiate.
+                match config.add_capabilities(fuser::consts::FUSE_OVER_IO_URING) {
+                    Ok(()) => match config.set_max_write(uring.max_write) {
+                        Ok(old) => tracing::info!(
+                            "requested FUSE_OVER_IO_URING, max_write set to {} (was {old})",
+                            uring.max_write
+                        ),
+                        // Leaving max_write alone would make the ring's payload buffers too small for
+                        // the kernel to accept, so registration would fail and the mount would fall
+                        // back to /dev/fuse.
+                        Err(nearest) => tracing::warn!(
+                            "requested FUSE_OVER_IO_URING but FUSE max_write {} was rejected (nearest \
+                             allowed is {nearest}); io_uring registration is likely to fail",
+                            uring.max_write
+                        ),
+                    },
+                    Err(_) => tracing::warn!(
+                        "the kernel does not support FUSE_OVER_IO_URING; falling back to /dev/fuse. \
+                         It requires Linux 6.14+ with fuse.enable_uring=Y"
+                    ),
+                }
+            }
+        }
+
         if self.config.allow_overwrite {
             // Overwrites require FUSE_ATOMIC_O_TRUNC capability on the host, so we will panic if the
             // host doesn't support it.

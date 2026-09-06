@@ -30,7 +30,7 @@ struct SessionAndConfig<FS>
 where
     FS: Filesystem + Send + Sync + 'static,
 {
-    session: Session<FS>,
+    session: Arc<Session<FS>>,
     clone_fuse_fd: bool,
 }
 
@@ -114,6 +114,13 @@ impl FuseSession {
                 .context("failed to spawn waiter thread")?
         };
 
+        let session = Arc::new(session);
+
+        // The io_uring transport does not carry FORGET, INTERRUPT, FUSE_INIT or notifications, so
+        // the classic worker pool always runs alongside it.
+        #[cfg(target_os = "linux")]
+        spawn_uring_workers(&session, &workers_tx)?;
+
         let session_and_config = SessionAndConfig { session, clone_fuse_fd };
         WorkerPool::start(session_and_config, workers_tx, max_worker_threads)
             .context("failed to start worker thread pool")?;
@@ -159,6 +166,57 @@ impl FuseSession {
         info!("attempting unmount");
         self.unmounter.unmount().context("failed to unmount FUSE session")
     }
+}
+
+/// Start the FUSE-over-io_uring workers, if the transport is enabled for this mount.
+///
+/// The workers block until FUSE_INIT has been negotiated on the classic path, so this can be called
+/// before the worker pool starts. Their handles join the same channel as the classic workers, so a
+/// shutdown waits for them too.
+#[cfg(target_os = "linux")]
+fn spawn_uring_workers<FS: Filesystem + Send + Sync + 'static>(
+    session: &Arc<Session<FS>>,
+    workers: &Sender<JoinHandle<io::Result<()>>>,
+) -> anyhow::Result<()> {
+    let settings = super::uring::UringSettings::from_env();
+    if !settings.enabled {
+        return Ok(());
+    }
+
+    let config = fuser::uring::UringConfig {
+        threads_per_queue: settings.threads_per_queue,
+        entries_per_thread: settings.entries_per_thread,
+        pin_threads: settings.pin_threads,
+    };
+    // A failure here means the kernel will keep using /dev/fuse, which is correct but slower, so
+    // warn loudly rather than failing the mount.
+    match fuser::uring::spawn_workers(session.clone(), config) {
+        Ok(handles) => {
+            info!(?settings, "started FUSE-over-io_uring workers");
+            // The ring workers have to be real OS threads, while the worker channel carries this
+            // crate's thread handles (Shuttle's under test), so one thread joins them all and
+            // reports on their behalf.
+            let waiter = thread::Builder::new()
+                .name("fuse-uring-waiter".to_owned())
+                .spawn(move || {
+                    let mut first_error = None;
+                    for handle in handles {
+                        let error = match handle.join() {
+                            Ok(Ok(())) => continue,
+                            Ok(Err(error)) => error,
+                            Err(_) => io::Error::other("a FUSE-over-io_uring worker panicked"),
+                        };
+                        error!("FUSE-over-io_uring worker failed: {error:?}");
+                        first_error = first_error.or(Some(error));
+                    }
+                    first_error.map_or(Ok(()), Err)
+                })
+                .context("failed to spawn the FUSE-over-io_uring waiter thread")?;
+            workers.send(waiter).expect("worker channel must be open");
+        }
+        Err(error) => warn!(?error, "could not start FUSE-over-io_uring workers, using /dev/fuse"),
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

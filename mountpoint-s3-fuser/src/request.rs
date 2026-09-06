@@ -151,6 +151,8 @@ impl<'a> Request<'a> {
                     config.max_readahead,
                     config.max_write
                 );
+                se.uring_payload_size
+                    .store(config.uring_payload_size(), Ordering::SeqCst);
                 se.initialized.store(true, Ordering::SeqCst);
                 return Ok(Some(x.reply(&config)));
             }

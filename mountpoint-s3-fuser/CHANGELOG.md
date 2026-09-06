@@ -1,5 +1,10 @@
 # FUSE for Rust - Changelog
 
+## Unreleased
+* Add the `uring` module, an optional Linux-only transport that carries FUSE requests over io_uring (`FUSE_OVER_IO_URING`) instead of `read`/`writev` on `/dev/fuse`
+* Add the `FUSE_OVER_IO_URING` capability constant (requires `abi-7-36` for `fuse_init_out.flags2`)
+* `ChannelSender` is now an opaque struct rather than a newtype over the session file, so a reply can be routed to either transport
+
 ## 0.16.0 - 2025-09-12
 * Add support for passthrough file descriptors
 * Change `KernelConfig` capabilities flags parameters to `u64`

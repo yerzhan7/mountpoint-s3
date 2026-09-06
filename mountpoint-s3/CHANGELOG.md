@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Other changes
+
+* Add an experimental FUSE-over-io_uring transport, off by default and enabled with the `UNSTABLE_MOUNTPOINT_FUSE_IO_URING` environment variable. It requires Linux 6.14 or later with `/sys/module/fuse/parameters/enable_uring` set to `Y`, and lowers FUSE `max_write` to 1 MiB while enabled. See [the development documentation](https://github.com/awslabs/mountpoint-s3/blob/main/doc/dev/FUSE_IO_URING.md).
+
 ## v1.24.0 (August 24, 2026)
 
 ### New features

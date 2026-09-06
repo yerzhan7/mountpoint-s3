@@ -207,6 +207,8 @@ pub mod consts {
     pub const FUSE_INIT_RESERVED: u64 = 1 << 31; // reserved, do not use
     #[cfg(feature = "abi-7-40")]
     pub const FUSE_PASSTHROUGH: u64 = 1 << 37; // filesystem wants to use passthrough files
+    #[cfg(feature = "abi-7-36")]
+    pub const FUSE_OVER_IO_URING: u64 = 1 << 41; // requests are delivered over io_uring (ABI 7.42)
 
     #[cfg(target_os = "macos")]
     pub const FUSE_ALLOCATE: u64 = 1 << 27;

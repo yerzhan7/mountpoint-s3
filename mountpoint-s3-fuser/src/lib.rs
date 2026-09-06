@@ -53,6 +53,8 @@ mod passthrough;
 mod reply;
 mod request;
 mod session;
+#[cfg(target_os = "linux")]
+pub mod uring;
 
 /// We generally support async reads
 #[cfg(not(target_os = "macos"))]
@@ -301,6 +303,29 @@ impl KernelConfig {
     #[cfg(feature = "abi-7-28")]
     fn max_pages(&self) -> u16 {
         ((max(self.max_write, self.max_readahead) - 1) / page_size::get() as u32) as u16 + 1
+    }
+
+    /// The payload buffer size an io_uring ring entry must register given this configuration.
+    ///
+    /// Mirrors the kernel's `fuse_uring_create`, which sizes the ring from the values negotiated in
+    /// FUSE_INIT: `max(FUSE_MIN_READ_BUFFER, fc->max_write, fc->max_pages * PAGE_SIZE)`. The kernel
+    /// clamps `max_pages` to `/proc/sys/fs/fuse/max_pages_limit`, but registering a larger buffer
+    /// than required is accepted, so we do not need to read that back.
+    pub(crate) fn uring_payload_size(&self) -> usize {
+        /// The kernel's `FUSE_MIN_READ_BUFFER`.
+        const FUSE_MIN_READ_BUFFER: usize = 8192;
+
+        #[cfg(feature = "abi-7-28")]
+        let pages = if self.requested & FUSE_MAX_PAGES != 0 {
+            self.max_pages() as usize * page_size::get()
+        } else {
+            // The kernel falls back to FUSE_DEFAULT_MAX_PAGES_PER_REQ.
+            32 * page_size::get()
+        };
+        #[cfg(not(feature = "abi-7-28"))]
+        let pages = 32 * page_size::get();
+
+        FUSE_MIN_READ_BUFFER.max(self.max_write as usize).max(pages)
     }
 }
 
