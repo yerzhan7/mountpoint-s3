@@ -2,6 +2,7 @@
 
 * `MockClient::put_object_single` now honors `PutObjectSingleParams::if_match` for requests without a write offset, failing with `PutObjectError::PreconditionFailed` when the object's ETag differs and with `PutObjectError::NoSuchKey` when the object does not exist, as S3 does. Previously the precondition was only checked on append requests. ([#1970](https://github.com/awslabs/mountpoint-s3/pull/1970))
 * Add `ObjectClient::poll_client_metrics` (default no-op). `S3CrtClient` implements it to emit `s3.client.*` metrics, which are no longer sampled at meta-request creation. ([#1957](https://github.com/awslabs/mountpoint-s3/pull/1957))
+* `InstanceInfo::instance_type` now reads the instance type from the system's DMI (Desktop Management Interface) data, the hardware identification that Linux exposes in `/sys/devices/virtual/dmi/id`, and only queries IMDS if it isn't found there. The DMI data is read even if `AWS_EC2_METADATA_DISABLED` is set.
 
 ## v0.22.1 (September 24, 2026)
 
