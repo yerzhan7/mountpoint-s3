@@ -257,7 +257,8 @@ The same expected bucket owner is used for both the mounted S3 bucket and the sh
 There are certain situations where Mountpoint receives a response from Amazon S3 indicating that a retry is necessary.
 For example, if an application generates high request rates (typically sustained rates of over 5,000 requests per second to a small number of objects), Mountpoint might receive HTTP 503 slowdown responses from S3.
 Mountpoint automatically retries these requests up to a total of 10 attempts, using jittered exponential backoff between attempts.
-If these attempts are exhausted, Mountpoint will return an error to your application (usually `EIO`).
+While S3 keeps throttling, Mountpoint may stop retrying sooner, to avoid adding load. See [Throttling errors](https://github.com/awslabs/mountpoint-s3/blob/main/doc/TROUBLESHOOTING.md#throttling-errors).
+When Mountpoint stops retrying, it returns an error to your application (usually `EIO`).
 If you need to modify the maximum number of attempts, set the `AWS_MAX_ATTEMPTS` environment variable.
 
 ## File system configuration
