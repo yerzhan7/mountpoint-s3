@@ -109,6 +109,7 @@ pub struct S3ClientConfig {
     request_payer: Option<String>,
     bucket_owner: Option<String>,
     max_attempts: Option<NonZeroUsize>,
+    retry_quota: bool,
     read_backpressure: bool,
     initial_read_window: usize,
     network_interface_names: Vec<String>,
@@ -132,6 +133,7 @@ impl Default for S3ClientConfig {
             request_payer: None,
             bucket_owner: None,
             max_attempts: None,
+            retry_quota: true,
             read_backpressure: false,
             initial_read_window: DEFAULT_PART_SIZE,
             network_interface_names: vec![],
@@ -224,6 +226,19 @@ impl S3ClientConfig {
     #[must_use = "S3ClientConfig follows a builder pattern"]
     pub fn max_attempts(mut self, max_attempts: NonZeroUsize) -> Self {
         self.max_attempts = Some(max_attempts);
+        self
+    }
+
+    /// Set whether retries are limited by a retry quota (the default). The quota is the token
+    /// bucket of the [standard retry strategy](https://docs.aws.amazon.com/sdkref/latest/guide/feature-retry-behavior.html):
+    /// all requests to the same host share it, each retry costs tokens and each success refunds
+    /// some. While it is empty, failed requests are not retried.
+    ///
+    /// Without the quota, failed requests are retried up to the maximum number of attempts, even
+    /// while S3 keeps failing requests, for example by throttling them.
+    #[must_use = "S3ClientConfig follows a builder pattern"]
+    pub fn retry_quota(mut self, retry_quota: bool) -> Self {
+        self.retry_quota = retry_quota;
         self
     }
 
@@ -477,10 +492,12 @@ impl S3CrtClientInner {
             .unwrap_or(3);
         client_config.retry_config(RetryConfig {
             // The CRT treats 0 retries as its default, so disabling retries needs its own mode
-            mode: if max_attempts > 1 {
+            mode: if max_attempts <= 1 {
+                RetryMode::None
+            } else if config.retry_quota {
                 RetryMode::Standard
             } else {
-                RetryMode::None
+                RetryMode::ExponentialBackoff
             },
             // Max *attempts* includes the initial attempt, the CRT's max *retries* does not, so
             // decrement by one
@@ -1809,6 +1826,20 @@ mod tests {
 
             let config = S3ClientConfig::default().max_attempts(NonZeroUsize::new(100).unwrap());
             S3CrtClient::new(config).expect("creating a new client should succeed");
+        }
+
+        /// Any number of attempts is a valid configuration without the retry quota, including one.
+        #[test]
+        fn client_new_without_retry_quota() {
+            // SAFETY: This test is run in a forked process, so won't affect any other concurrently running tests.
+            unsafe { std::env::remove_var("AWS_MAX_ATTEMPTS"); }
+
+            for max_attempts in [1, 2, 100] {
+                let config = S3ClientConfig::default()
+                    .max_attempts(NonZeroUsize::new(max_attempts).unwrap())
+                    .retry_quota(false);
+                S3CrtClient::new(config).expect("creating a new client should succeed");
+            }
         }
 
         #[test]

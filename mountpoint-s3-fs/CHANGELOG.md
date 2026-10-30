@@ -1,5 +1,6 @@
 ## Unreleased (v0.12.0)
 
+* Add experimental environment variable `UNSTABLE_MOUNTPOINT_DISABLE_RETRY_QUOTA` to turn off the S3 client's retry quota.
 * Update to latest S3 client.
 * `Superblock` now issues its S3 requests through the new `MetadataClient` trait, which covers the HeadObject, ListObjectsV2, DeleteObject and RenameObject requests it makes, with errors classified by `MetadataError`. Every `ObjectClient` implements `MetadataClient`, so existing uses of `Superblock` are unchanged. The new `mock` feature adds `InMemoryMetadata`, an in-memory `MetadataClient` over a `MockBucket` for tests. ([#1998](https://github.com/awslabs/mountpoint-s3/pull/1998))
 * Incremental uploads now send an `If-Match` precondition whenever the ETag of the object being written is known, including when the write starts at offset 0. Previously, appending to an existing *empty* object issued an unconditional `PutObject`, which could silently overwrite a concurrent modification. ([#1970](https://github.com/awslabs/mountpoint-s3/pull/1970))

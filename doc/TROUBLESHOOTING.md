@@ -311,6 +311,9 @@ This is the AWS SDKs' [standard retry mode](https://docs.aws.amazon.com/sdkref/l
 If your application retries after an error, use exponential backoff with full jitter that spreads retries over tens of seconds, for example starting at 1 second and doubling up to 20 seconds between attempts.
 Retrying within a second or two adds to the request rate on a prefix that S3 is already throttling, so throttling can last longer.
 
+If your application retries failed file operations anyway, you can let Mountpoint keep retrying instead by turning off the retry quota with the unstable `UNSTABLE_MOUNTPOINT_DISABLE_RETRY_QUOTA` environment variable.
+See [Mountpoint's configuration documentation](https://github.com/awslabs/mountpoint-s3/blob/main/doc/CONFIGURATION.md#retry-quota) for the trade-offs, including raising `--max-threads`.
+
 **Avoid polling for files that don't exist yet.**
 Each check, for example `stat`, `open` or listing the directory, sends requests to S3 even when the file isn't there.
 A lookup sends up to two requests for each path component that isn't cached.

@@ -231,6 +231,10 @@ impl ClientConfig {
         // jitter, and 20s max backoff time, 10 attempts will take an average of 55 seconds.
         client_config = client_config.max_attempts(NonZeroUsize::new(10).unwrap());
 
+        if disable_retry_quota() {
+            client_config = client_config.retry_quota(false);
+        }
+
         const ENV_VAR_KEY_CRT_ELG_THREADS: &str = "UNSTABLE_CRT_EVENTLOOP_THREADS";
         if let Some(crt_elg_threads) = std::env::var_os(ENV_VAR_KEY_CRT_ELG_THREADS) {
             let crt_elg_threads = crt_elg_threads.to_string_lossy().parse::<u16>().unwrap_or_else(|_| {
@@ -266,6 +270,21 @@ impl ClientConfig {
             Ok(client)
         }
     }
+}
+
+/// Return whether the S3 client should retry failed requests without a retry quota.
+///
+/// While S3 keeps failing requests, the quota runs out and Mountpoint stops retrying, which helps S3 recover
+/// unless the application retries the failed file operations itself. For those applications, letting
+/// Mountpoint retry with backoff sends fewer requests. We do not recommend this configuration otherwise, and it
+/// may be removed at any time without notice.
+fn disable_retry_quota() -> bool {
+    const ENV_VAR_KEY: &str = "UNSTABLE_MOUNTPOINT_DISABLE_RETRY_QUOTA";
+    let disable = std::env::var_os(ENV_VAR_KEY).is_some_and(|x| x.eq_ignore_ascii_case("TRUE") || x == "1");
+    if disable {
+        tracing::warn!("{ENV_VAR_KEY} is set and 'truthy', disabling the retry quota");
+    }
+    disable
 }
 
 /// Validate a client by sending a ListObjectsV2 request to the given bucket/prefix. If the region was not

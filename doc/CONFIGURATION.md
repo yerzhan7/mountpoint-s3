@@ -730,3 +730,12 @@ This should work well for most use cases but if you need to use a different valu
 
 > [!WARNING]
 > Overriding the default maximum prefetch window size may reduce overall read throughput.
+
+### Retry quota
+
+Once Mountpoint's retry quota runs out, for example while S3 throttles a prefix, Mountpoint returns errors to your application (usually `EIO`) without retrying. See [Throttling errors](https://github.com/awslabs/mountpoint-s3/blob/main/doc/TROUBLESHOOTING.md#throttling-errors) for how the retry quota works.
+
+If your application retries failed file operations itself, letting Mountpoint retry with backoff instead can send fewer requests to S3. You can turn off the retry quota by setting the `UNSTABLE_MOUNTPOINT_DISABLE_RETRY_QUOTA` environment variable to `true` at mount time. Mountpoint then retries failed requests up to the maximum number of attempts (10 by default, or the value of `AWS_MAX_ATTEMPTS`), however many other requests fail.
+
+> [!WARNING]
+> Without the retry quota, Mountpoint sends more requests to S3 while S3 keeps failing them, and a file operation may wait for more than a minute while its requests are retried. Each waiting operation holds one of Mountpoint's FUSE threads, so raise `--max-threads` above the number of file operations your application may have waiting at the same time.

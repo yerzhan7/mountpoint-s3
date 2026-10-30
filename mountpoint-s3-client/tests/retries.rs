@@ -52,7 +52,7 @@ async fn spawn_throttling_server() -> (SocketAddr, Arc<AtomicUsize>) {
     (addr, requests)
 }
 
-fn make_client(endpoint: SocketAddr, max_attempts: usize) -> S3CrtClient {
+fn make_client(endpoint: SocketAddr, max_attempts: usize, retry_quota: bool) -> S3CrtClient {
     let endpoint_uri = Uri::new_from_str(&Allocator::default(), format!("http://{endpoint}")).expect("parse uri");
     let endpoint_config = EndpointConfig::new("us-east-1")
         .addressing_style(AddressingStyle::Path)
@@ -60,19 +60,27 @@ fn make_client(endpoint: SocketAddr, max_attempts: usize) -> S3CrtClient {
     let client_config = S3ClientConfig::new()
         .endpoint_config(endpoint_config)
         .auth_config(S3ClientAuthConfig::NoSigning)
-        .max_attempts(NonZeroUsize::new(max_attempts).unwrap());
+        .max_attempts(NonZeroUsize::new(max_attempts).unwrap())
+        .retry_quota(retry_quota);
     S3CrtClient::new(client_config).expect("build S3CrtClient")
 }
 
 /// Send many requests that all fail, and count their retries. With two attempts, each request is
 /// retried at most once, within 500ms. The retry quota starts with 500 tokens and a retry after a
-/// 503 costs 5, so it allows about 100 retries while every request fails.
-#[test_case(1, 0..=0; "one attempt")]
-#[test_case(2, 1..=REQUESTS - 1; "two attempts")]
+/// 503 costs 5, so it allows about 100 retries while every request fails. Without the quota,
+/// every request is retried.
+#[test_case(1, true, 0..=0; "one attempt")]
+#[test_case(1, false, 0..=0; "one attempt without retry quota")]
+#[test_case(2, true, 1..=REQUESTS - 1; "two attempts")]
+#[test_case(2, false, REQUESTS..=REQUESTS; "two attempts without retry quota")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_retries_of_throttled_requests(max_attempts: usize, expected_retries: RangeInclusive<usize>) {
+async fn test_retries_of_throttled_requests(
+    max_attempts: usize,
+    retry_quota: bool,
+    expected_retries: RangeInclusive<usize>,
+) {
     let (addr, received) = spawn_throttling_server().await;
-    let client = make_client(addr, max_attempts);
+    let client = make_client(addr, max_attempts, retry_quota);
 
     let results = join_all((0..REQUESTS).map(|i| {
         let client = &client;

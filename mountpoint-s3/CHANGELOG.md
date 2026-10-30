@@ -1,5 +1,6 @@
 ## Unreleased (v1.24.1)
 
+* Add the unstable `UNSTABLE_MOUNTPOINT_DISABLE_RETRY_QUOTA` environment variable. When set to `true`, Mountpoint keeps retrying throttled requests up to the maximum number of attempts even while S3 keeps throttling, instead of failing them without retrying once its retry quota runs out. It's meant for applications that retry failed file operations themselves. See [the configuration documentation](https://github.com/awslabs/mountpoint-s3/blob/main/doc/CONFIGURATION.md#retry-quota).
 * Fix `AWS_MAX_ATTEMPTS=1` not disabling retries. Failed requests were still attempted up to 4 times.
 * Fix Mountpoint failing to start when `AWS_MAX_ATTEMPTS` is set to more than 64. ([#2010](https://github.com/awslabs/mountpoint-s3/pull/2010))
 * Make `--incremental-upload` consistently check for concurrent writes when appending (i.e. without `O_TRUNC`), even at offset 0. Previously, appending to an existing empty object could silently overwrite another writer's changes instead of failing with `EIO`. ([#1970](https://github.com/awslabs/mountpoint-s3/pull/1970) by @yerzhan7)
