@@ -8,7 +8,7 @@ use crate::common::thread::ThreadId;
 use crate::common::uri::Uri;
 use crate::http::request_response::{Headers, Message};
 use crate::io::channel_bootstrap::ClientBootstrap;
-use crate::io::retry_strategy::RetryStrategy;
+use crate::io::retry_strategy::{ExponentialBackoffJitterMode, RetryStrategy};
 use crate::io::tls::TlsConnectionOptions;
 use crate::{CrtError, ToAwsByteCursor, aws_byte_cursor_as_slice};
 use futures::Future;
@@ -159,10 +159,22 @@ impl ClientConfig {
         self
     }
 
-    /// Retry strategy used to reschedule failed requests
+    /// Retry strategy used to reschedule failed requests. Takes precedence over
+    /// [ClientConfig::retry_config].
     pub fn retry_strategy(&mut self, retry_strategy: RetryStrategy) -> &mut Self {
         self.inner.retry_strategy = retry_strategy.inner.as_ptr();
         self.retry_strategy = Some(retry_strategy);
+        self
+    }
+
+    /// Configuration of the retry strategy the client creates, unless one is set with
+    /// [ClientConfig::retry_strategy].
+    pub fn retry_config(&mut self, retry_config: RetryConfig) -> &mut Self {
+        let inner = &mut self.inner.retry_config;
+        inner.retry_mode = retry_config.mode.into();
+        inner.max_retries = retry_config.max_retries;
+        inner.backoff_scale_factor_ms = retry_config.backoff_scale_factor.as_millis().min(u32::MAX as u128) as u32;
+        inner.jitter_mode = retry_config.jitter_mode.into();
         self
     }
 
@@ -248,6 +260,44 @@ impl ClientConfig {
     pub fn max_active_connections_override(&mut self, max_active_connections_override: u32) -> &mut Self {
         self.inner.max_active_connections_override = max_active_connections_override;
         self
+    }
+}
+
+/// Configuration of the retry strategy the client creates. See [ClientConfig::retry_config].
+#[derive(Debug, Clone, Copy)]
+pub struct RetryConfig {
+    /// Which retry strategy to create
+    pub mode: RetryMode,
+    /// Maximum number of retries per request. 0 uses the CRT's default of 5; to disable retries,
+    /// use [RetryMode::None].
+    pub max_retries: usize,
+    /// Scaling factor for the exponential backoff. Zero uses the CRT's default of 500ms.
+    pub backoff_scale_factor: Duration,
+    /// Jitter mode for the exponential backoff
+    pub jitter_mode: ExponentialBackoffJitterMode,
+}
+
+/// Retry strategies the client can create
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryMode {
+    /// Retry with exponential backoff and jitter, within a retry quota (token bucket) for each
+    /// host: each retry costs tokens, each success refunds some, and failed requests are not
+    /// retried while the quota is empty.
+    Standard,
+    /// Retry with exponential backoff and jitter like [RetryMode::Standard], but without the retry
+    /// quota.
+    ExponentialBackoff,
+    /// Attempt each request exactly once
+    None,
+}
+
+impl From<RetryMode> for aws_s3_retry_mode {
+    fn from(mode: RetryMode) -> Self {
+        match mode {
+            RetryMode::Standard => aws_s3_retry_mode::AWS_S3_RETRY_MODE_STANDARD,
+            RetryMode::ExponentialBackoff => aws_s3_retry_mode::AWS_S3_RETRY_MODE_EXPONENTIAL_BACKOFF,
+            RetryMode::None => aws_s3_retry_mode::AWS_S3_RETRY_MODE_NONE,
+        }
     }
 }
 
@@ -1941,9 +1991,14 @@ mod tests {
     use crate::io::channel_bootstrap::{ClientBootstrap, ClientBootstrapOptions};
     use crate::io::event_loop::EventLoopGroup;
     use crate::io::host_resolver::{HostResolver, HostResolverDefaultOptions};
+    use crate::io::retry_strategy::ExponentialBackoffJitterMode;
     use crate::io::tls::{TlsConnectionOptions, TlsContext, TlsContextOptions};
-    use crate::s3::client::{Client, ClientConfig, RequestType, init_signing_config};
-    use mountpoint_s3_crt_sys::{aws_event_loop_group_get_loop_count, aws_s3_meta_request_tls_mode};
+    use crate::s3::client::{Client, ClientConfig, RequestType, RetryConfig, RetryMode, init_signing_config};
+    use mountpoint_s3_crt_sys::{
+        aws_event_loop_group_get_loop_count, aws_exponential_backoff_jitter_mode, aws_s3_meta_request_tls_mode,
+        aws_s3_retry_mode,
+    };
+    use std::time::Duration;
 
     #[test_case(aws_s3_request_type::AWS_S3_REQUEST_TYPE_UNKNOWN, RequestType::Unknown)]
     #[test_case(aws_s3_request_type::AWS_S3_REQUEST_TYPE_HEAD_OBJECT, RequestType::HeadObject)]
@@ -1967,6 +2022,30 @@ mod tests {
         config.tls_connection_options(conn_opts);
         assert!(!config.inner.tls_connection_options.is_null());
         assert_eq!(config.inner.tls_mode, aws_s3_meta_request_tls_mode::AWS_MR_TLS_ENABLED);
+    }
+
+    /// Verify that [`ClientConfig::retry_config`] sets the fields of the inner retry config.
+    #[test_case(RetryMode::Standard, aws_s3_retry_mode::AWS_S3_RETRY_MODE_STANDARD)]
+    #[test_case(
+        RetryMode::ExponentialBackoff,
+        aws_s3_retry_mode::AWS_S3_RETRY_MODE_EXPONENTIAL_BACKOFF
+    )]
+    #[test_case(RetryMode::None, aws_s3_retry_mode::AWS_S3_RETRY_MODE_NONE)]
+    fn retry_config_wiring(mode: RetryMode, expected_mode: aws_s3_retry_mode) {
+        let mut config = ClientConfig::new();
+        config.retry_config(RetryConfig {
+            mode,
+            max_retries: 9,
+            backoff_scale_factor: Duration::from_millis(500),
+            jitter_mode: ExponentialBackoffJitterMode::Full,
+        });
+        assert_eq!(config.inner.retry_config.retry_mode, expected_mode);
+        assert_eq!(config.inner.retry_config.max_retries, 9);
+        assert_eq!(config.inner.retry_config.backoff_scale_factor_ms, 500);
+        assert_eq!(
+            config.inner.retry_config.jitter_mode,
+            aws_exponential_backoff_jitter_mode::AWS_EXPONENTIAL_BACKOFF_JITTER_FULL
+        );
     }
 
     /// The client starts a single file I/O thread, whatever the size of its event loop group.

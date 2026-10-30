@@ -1,5 +1,6 @@
 ## Unreleased (v0.17.0)
 
+* Add `ClientConfig::retry_config` to configure the retry strategy that the S3 client creates when none is set with `ClientConfig::retry_strategy`. Its `RetryMode` can also select the standard strategy without its retry quota (`RetryMode::ExponentialBackoff`), or no retries (`RetryMode::None`).
 * Update to latest CRT dependencies.
 
 ## v0.16.2 (October 6, 2026)

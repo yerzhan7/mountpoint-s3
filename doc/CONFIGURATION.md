@@ -259,7 +259,7 @@ For example, if an application generates high request rates (typically sustained
 Mountpoint automatically retries these requests up to a total of 10 attempts, using jittered exponential backoff between attempts.
 While S3 keeps throttling, Mountpoint may stop retrying sooner, to avoid adding load. See [Throttling errors](https://github.com/awslabs/mountpoint-s3/blob/main/doc/TROUBLESHOOTING.md#throttling-errors).
 When Mountpoint stops retrying, it returns an error to your application (usually `EIO`).
-If you need to modify the maximum number of attempts, set the `AWS_MAX_ATTEMPTS` environment variable.
+If you need to modify the maximum number of attempts, set the `AWS_MAX_ATTEMPTS` environment variable, for example to `1` to turn off retries.
 
 ## File system configuration
 
